@@ -35,10 +35,16 @@
 #define PIN_COLOR_S3 A0  // Analog pin used as digital output
 
 // IR Sensors (Opponent detection ONLY, not boundaries)
+// WARNING: Pin 1 is Serial TX - IR2 won't work when DEBUG_MODE or TEST_SENSORS_ONLY is enabled!
+// For testing, use only IR pair 1 (pins 8,9) or disable Serial debugging
 #define PIN_IR_LED_1 9
 #define PIN_IR_RX_1 8
 #define PIN_IR_LED_2 2
-#define PIN_IR_RX_2 1
+#define PIN_IR_RX_2 1    // CAUTION: Conflicts with Serial TX when debugging enabled!
+
+// I2C addresses for LSM6DSOX gyroscope (A4=SDA, A5=SCL on Arduino Uno)
+#define LSM6DSOX_ADDR_PRIMARY 0x6A   // Default address (SA0 pin LOW or floating)
+#define LSM6DSOX_ADDR_SECONDARY 0x6B // Alternate address (SA0 pin HIGH)
 
 // Debug outputs
 #define PIN_BUZZER 3
@@ -218,19 +224,56 @@ void setup() {
   pinMode(PIN_LED_1, OUTPUT);
   pinMode(PIN_LED_2, OUTPUT);
 
-  // 7. Initialize gyroscope
-  if (!lsm6ds.begin_I2C()) {
-    gyroAvailable = false;
-    #if DEBUG_MODE
-      Serial.println("ERROR: Gyroscope init failed - using dead reckoning only");
-    #endif
-    // Continue anyway - can fall back to dead reckoning
-  } else {
+  // 7. Initialize gyroscope (LSM6DSOX on I2C: A4=SDA, A5=SCL)
+  #if DEBUG_MODE || TEST_SENSORS_ONLY
+    Serial.println("Scanning I2C bus for gyroscope...");
+    // Scan I2C bus to find devices
+    byte foundAddr = 0;
+    for(byte addr = 1; addr < 127; addr++) {
+      Wire.beginTransmission(addr);
+      if(Wire.endTransmission() == 0) {
+        Serial.print("  I2C device found at 0x");
+        Serial.println(addr, HEX);
+        if(addr == LSM6DSOX_ADDR_PRIMARY || addr == LSM6DSOX_ADDR_SECONDARY) {
+          foundAddr = addr;
+        }
+      }
+    }
+    if(foundAddr == 0) {
+      Serial.println("  No LSM6DSOX found! Check wiring:");
+      Serial.println("  - VCC -> 3.3V or 5V");
+      Serial.println("  - GND -> GND");
+      Serial.println("  - SDA -> A4");
+      Serial.println("  - SCL -> A5");
+    }
+  #endif
+
+  // Try primary address first, then secondary
+  gyroAvailable = false;
+  if(lsm6ds.begin_I2C(LSM6DSOX_ADDR_PRIMARY)) {
     gyroAvailable = true;
+    #if DEBUG_MODE || TEST_SENSORS_ONLY
+      Serial.print("Gyroscope found at 0x");
+      Serial.println(LSM6DSOX_ADDR_PRIMARY, HEX);
+    #endif
+  } else if(lsm6ds.begin_I2C(LSM6DSOX_ADDR_SECONDARY)) {
+    gyroAvailable = true;
+    #if DEBUG_MODE || TEST_SENSORS_ONLY
+      Serial.print("Gyroscope found at 0x");
+      Serial.println(LSM6DSOX_ADDR_SECONDARY, HEX);
+    #endif
+  }
+
+  if(gyroAvailable) {
     lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_250_DPS);
     lsm6ds.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
-    #if DEBUG_MODE
-      Serial.println("Gyroscope initialized successfully");
+    #if DEBUG_MODE || TEST_SENSORS_ONLY
+      Serial.println("Gyroscope initialized successfully!");
+    #endif
+  } else {
+    #if DEBUG_MODE || TEST_SENSORS_ONLY
+      Serial.println("ERROR: Gyroscope init failed - using dead reckoning only");
+      Serial.println("WARNING: Pin 1 conflict - IR sensor 2 disabled during Serial debug");
     #endif
   }
 
@@ -246,14 +289,19 @@ void setup() {
     Serial.println("Color: Lower duration = MORE light reflected");
     Serial.println("       Red < Blue = RED surface (correct for TCS3200)");
     Serial.println("       Both > 600 = BLACK boundary");
-    Serial.println("IR: 0 = opponent detected, 1 = clear");
+    Serial.println("IR: 0 = detected, 1 = clear");
+    Serial.println("*** WARNING: IR pair 2 (pins 1,2) DISABLED - conflicts with Serial TX ***");
+    Serial.println("*** Only IR pair 1 (pins 8,9) active during this test ***");
     Serial.println();
 
     while(true) {
       unsigned long red = measureColorDuration(true);
       unsigned long blue = measureColorDuration(false);
       bool black = (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD);
-      bool opponent = scanForOpponent();
+
+      // Read IR sensors individually for detailed output
+      int ir1 = irDetect(PIN_IR_LED_1, PIN_IR_RX_1, 38000);
+      // IR2 disabled during serial debug (pin 1 = Serial TX)
 
       Serial.print("Red: "); Serial.print(red);
       Serial.print(" | Blue: "); Serial.print(blue);
@@ -263,16 +311,15 @@ void setup() {
       if(black) {
         Serial.print("BLACK");
       } else if(red < blue) {
-        // Lower red duration = more red light reflected = RED surface
         Serial.print("RED");
       } else {
-        // Lower blue duration = more blue light reflected = BLUE surface
         Serial.print("BLUE");
       }
 
-      // Opponent detection
-      Serial.print(" | IR: ");
-      Serial.print(opponent == 0 ? "DETECTED" : "clear");
+      // Individual IR sensor readings
+      Serial.print(" | IR1(8,9): ");
+      Serial.print(ir1 == 0 ? "DETECTED" : "clear");
+      Serial.print(" | IR2: DISABLED");
 
       // Gyroscope test (if available)
       if(gyroAvailable) {
@@ -755,12 +802,18 @@ int checkFieldSide() {
 
 bool scanForOpponent() {
   // IR sensors detect opponent robot ONLY (not boundaries)
+  // NOTE: IR pair 2 (pins 1,2) conflicts with Serial TX when debugging!
 
   int frontLeft = irDetect(PIN_IR_LED_1, PIN_IR_RX_1, 38000);
-  int frontRight = irDetect(PIN_IR_LED_2, PIN_IR_RX_2, 38000);
 
-  // IR returns 0 when object detected
-  return (frontLeft == 0 || frontRight == 0);
+  // Only use IR pair 2 when Serial is NOT active (pins 0,1 free)
+  #if !DEBUG_MODE && !TEST_SENSORS_ONLY
+    int frontRight = irDetect(PIN_IR_LED_2, PIN_IR_RX_2, 38000);
+    return (frontLeft == 0 || frontRight == 0);
+  #else
+    // When debugging, only IR pair 1 works (pair 2 conflicts with Serial TX)
+    return (frontLeft == 0);
+  #endif
 }
 
 int irDetect(int irLedPin, int irReceiverPin, long frequency) {
