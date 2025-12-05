@@ -119,6 +119,7 @@ float gyroHeading = 0.0;
 
 // Safety flags
 bool positionUncertain = false;
+bool gyroAvailable = false;  // Track if gyroscope initialized successfully
 
 // Phase completion tracking (for adaptive transitions)
 bool phase1Complete = false;
@@ -219,15 +220,17 @@ void setup() {
 
   // 7. Initialize gyroscope
   if (!lsm6ds.begin_I2C()) {
+    gyroAvailable = false;
     #if DEBUG_MODE
-      Serial.println("ERROR: Gyroscope init failed");
+      Serial.println("ERROR: Gyroscope init failed - using dead reckoning only");
     #endif
     // Continue anyway - can fall back to dead reckoning
   } else {
+    gyroAvailable = true;
     lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_250_DPS);
     lsm6ds.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
     #if DEBUG_MODE
-      Serial.println("Gyroscope initialized");
+      Serial.println("Gyroscope initialized successfully");
     #endif
   }
 
@@ -238,17 +241,34 @@ void setup() {
   digitalWrite(PIN_LED_1, LOW);
 
   #if TEST_SENSORS_ONLY
-    // Test mode - just display sensor readings
+    // Test mode - just display sensor readings with interpretation
+    Serial.println("\n=== SENSOR TEST MODE ===");
+    Serial.println("Lower duration = MORE light reflected");
+    Serial.println("Red < Blue = RED surface | Blue < Red = BLUE surface");
+    Serial.println("Both > 600 = BLACK boundary\n");
+
     while(true) {
       unsigned long red = measureColorDuration(true);
       unsigned long blue = measureColorDuration(false);
-      bool black = detectBlackBoundary();
+      bool black = (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD);
       bool opponent = scanForOpponent();
 
       Serial.print("Red: "); Serial.print(red);
       Serial.print(" | Blue: "); Serial.print(blue);
-      Serial.print(" | Black: "); Serial.print(black);
-      Serial.print(" | Opponent: "); Serial.println(opponent);
+
+      // Show interpretation
+      Serial.print(" | Surface: ");
+      if(black) {
+        Serial.print("BLACK");
+      } else if(red < blue) {
+        Serial.print("RED");
+      } else {
+        Serial.print("BLUE");
+      }
+
+      Serial.print(" | Opponent: ");
+      Serial.println(opponent == 0 ? "DETECTED" : "none");
+
       delay(500);
     }
   #endif
@@ -734,6 +754,11 @@ int irDetect(int irLedPin, int irReceiverPin, long frequency) {
 }
 
 void updateGyroscope() {
+  // Skip if gyroscope not available - rely on dead reckoning
+  if(!gyroAvailable) {
+    return;
+  }
+
   sensors_event_t accel, gyro, temp;
 
   if(!lsm6ds.getEvent(&accel, &gyro, &temp)) {
