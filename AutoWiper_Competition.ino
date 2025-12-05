@@ -196,8 +196,9 @@ void setup() {
     Serial.println("=== AUTOWIPER INITIALIZATION ===");
   #endif
 
-  // 2. I2C for gyroscope
+  // 2. I2C for gyroscope - IMPORTANT: delay after Wire.begin() for bus stabilization
   Wire.begin();
+  delay(100);  // Allow I2C bus to stabilize
 
   // 3. Attach servos
   servoLeft.attach(PIN_SERVO_LEFT);
@@ -226,41 +227,60 @@ void setup() {
 
   // 7. Initialize gyroscope (LSM6DSOX on I2C: A4=SDA, A5=SCL)
   #if DEBUG_MODE || TEST_SENSORS_ONLY
-    Serial.println("Scanning I2C bus for gyroscope...");
-    // Scan I2C bus to find devices
-    byte foundAddr = 0;
+    Serial.println("\n--- I2C Bus Scan ---");
+    Serial.println("Scanning for devices on I2C bus...");
+    int deviceCount = 0;
     for(byte addr = 1; addr < 127; addr++) {
       Wire.beginTransmission(addr);
-      if(Wire.endTransmission() == 0) {
-        Serial.print("  I2C device found at 0x");
-        Serial.println(addr, HEX);
-        if(addr == LSM6DSOX_ADDR_PRIMARY || addr == LSM6DSOX_ADDR_SECONDARY) {
-          foundAddr = addr;
-        }
+      byte error = Wire.endTransmission();
+      if(error == 0) {
+        Serial.print("  Device found at 0x");
+        if(addr < 16) Serial.print("0");
+        Serial.print(addr, HEX);
+        // Identify known devices
+        if(addr == 0x6A) Serial.print(" <- LSM6DSOX (default)");
+        else if(addr == 0x6B) Serial.print(" <- LSM6DSOX (alt addr)");
+        Serial.println();
+        deviceCount++;
       }
     }
-    if(foundAddr == 0) {
-      Serial.println("  No LSM6DSOX found! Check wiring:");
-      Serial.println("  - VCC -> 3.3V or 5V");
+    if(deviceCount == 0) {
+      Serial.println("  NO I2C DEVICES FOUND!");
+      Serial.println("\n  Check LSM6DSOX wiring:");
+      Serial.println("  - VIN/VCC -> 5V (or 3.3V)");
       Serial.println("  - GND -> GND");
-      Serial.println("  - SDA -> A4");
-      Serial.println("  - SCL -> A5");
+      Serial.println("  - SDA -> A4 (Arduino Uno)");
+      Serial.println("  - SCL -> A5 (Arduino Uno)");
+      Serial.println("  - Ensure good connections (no loose wires)");
+    } else {
+      Serial.print("  Total devices found: ");
+      Serial.println(deviceCount);
     }
+    Serial.println();
   #endif
 
-  // Try primary address first, then secondary
+  // Try to initialize gyroscope - let library auto-detect first
   gyroAvailable = false;
-  if(lsm6ds.begin_I2C(LSM6DSOX_ADDR_PRIMARY)) {
+
+  // Method 1: Try default initialization (library handles address)
+  if(lsm6ds.begin_I2C()) {
     gyroAvailable = true;
     #if DEBUG_MODE || TEST_SENSORS_ONLY
-      Serial.print("Gyroscope found at 0x");
-      Serial.println(LSM6DSOX_ADDR_PRIMARY, HEX);
+      Serial.println("Gyroscope: Initialized with default settings");
     #endif
-  } else if(lsm6ds.begin_I2C(LSM6DSOX_ADDR_SECONDARY)) {
+  }
+  // Method 2: Try explicit primary address (0x6A)
+  else if(lsm6ds.begin_I2C(LSM6DSOX_ADDR_PRIMARY, &Wire)) {
     gyroAvailable = true;
     #if DEBUG_MODE || TEST_SENSORS_ONLY
-      Serial.print("Gyroscope found at 0x");
-      Serial.println(LSM6DSOX_ADDR_SECONDARY, HEX);
+      Serial.println("Gyroscope: Initialized at 0x6A");
+    #endif
+  }
+  // Method 3: Try explicit secondary address (0x6B)
+  else if(lsm6ds.begin_I2C(LSM6DSOX_ADDR_SECONDARY, &Wire)) {
+    gyroAvailable = true;
+    #if DEBUG_MODE || TEST_SENSORS_ONLY
+      Serial.println("Gyroscope: Initialized at 0x6B");
     #endif
   }
 
@@ -268,14 +288,25 @@ void setup() {
     lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_250_DPS);
     lsm6ds.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
     #if DEBUG_MODE || TEST_SENSORS_ONLY
-      Serial.println("Gyroscope initialized successfully!");
+      Serial.println("Gyroscope: Configuration complete!");
+      // Test read
+      sensors_event_t accel, gyro, temp;
+      if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
+        Serial.print("  Test read - GyroZ: ");
+        Serial.println(gyro.gyro.z, 3);
+      }
     #endif
   } else {
     #if DEBUG_MODE || TEST_SENSORS_ONLY
-      Serial.println("ERROR: Gyroscope init failed - using dead reckoning only");
-      Serial.println("WARNING: Pin 1 conflict - IR sensor 2 disabled during Serial debug");
+      Serial.println("ERROR: Gyroscope initialization FAILED");
+      Serial.println("  Robot will use dead reckoning (no drift correction)");
+      Serial.println("  Check wiring and ensure LSM6DSOX is properly connected");
     #endif
   }
+
+  #if DEBUG_MODE || TEST_SENSORS_ONLY
+    Serial.println("\nWARNING: IR sensor 2 (pins 1,2) disabled - Pin 1 = Serial TX");
+  #endif
 
   // 8. MANDATORY 2-SECOND DELAY (competition requirement)
   statusBeep(3000, 500);
@@ -287,47 +318,59 @@ void setup() {
     // Test mode - display all sensor readings with interpretation
     Serial.println("\n=== SENSOR TEST MODE ===");
     Serial.println("Color: Lower duration = MORE light reflected");
-    Serial.println("       Red < Blue = RED surface (correct for TCS3200)");
+    Serial.println("       Red < Blue = RED surface");
     Serial.println("       Both > 600 = BLACK boundary");
-    Serial.println("IR: 0 = detected, 1 = clear");
-    Serial.println("*** WARNING: IR pair 2 (pins 1,2) DISABLED - conflicts with Serial TX ***");
-    Serial.println("*** Only IR pair 1 (pins 8,9) active during this test ***");
     Serial.println();
+    Serial.println("IR Sensor Test:");
+    Serial.println("  - IR1 uses pins 8 (RX) and 9 (LED)");
+    Serial.println("  - IR2 DISABLED (pin 1 conflicts with Serial TX)");
+    Serial.println("  - Place object 2-6 inches in front of IR sensor");
+    Serial.println("  - IR receiver should output LOW (0) when detecting 38kHz IR");
+    Serial.println();
+
+    // Initial IR receiver state check (without sending IR)
+    Serial.print("IR1 Receiver idle state (pin 8): ");
+    Serial.println(digitalRead(PIN_IR_RX_1) == HIGH ? "HIGH (normal)" : "LOW (unusual)");
+    Serial.println();
+    Serial.println("Starting continuous sensor readings...\n");
 
     while(true) {
       unsigned long red = measureColorDuration(true);
       unsigned long blue = measureColorDuration(false);
       bool black = (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD);
 
-      // Read IR sensors individually for detailed output
+      // Read IR sensor with detailed timing
       int ir1 = irDetect(PIN_IR_LED_1, PIN_IR_RX_1, 38000);
-      // IR2 disabled during serial debug (pin 1 = Serial TX)
 
       Serial.print("Red: "); Serial.print(red);
       Serial.print(" | Blue: "); Serial.print(blue);
 
-      // Show surface interpretation (CORRECT LOGIC: lower = more reflection)
-      Serial.print(" | Surface: ");
+      // Show surface interpretation
+      Serial.print(" | ");
       if(black) {
         Serial.print("BLACK");
       } else if(red < blue) {
-        Serial.print("RED");
+        Serial.print("RED  ");
       } else {
-        Serial.print("BLUE");
+        Serial.print("BLUE ");
       }
 
-      // Individual IR sensor readings
-      Serial.print(" | IR1(8,9): ");
-      Serial.print(ir1 == 0 ? "DETECTED" : "clear");
-      Serial.print(" | IR2: DISABLED");
+      // IR sensor reading with clear status
+      Serial.print(" | IR1: ");
+      if(ir1 == 0) {
+        Serial.print("**DETECTED**");
+      } else {
+        Serial.print("clear       ");
+      }
 
-      // Gyroscope test (if available)
+      // Gyroscope
       if(gyroAvailable) {
         sensors_event_t accel, gyro, temp;
         if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
-          Serial.print(" | GyroZ: "); Serial.print(gyro.gyro.z, 2);
+          Serial.print(" | Gyro: ");
+          Serial.print(gyro.gyro.z, 2);
         } else {
-          Serial.print(" | Gyro: READ_FAIL");
+          Serial.print(" | Gyro: FAIL");
         }
       } else {
         Serial.print(" | Gyro: N/A");
@@ -817,11 +860,21 @@ bool scanForOpponent() {
 }
 
 int irDetect(int irLedPin, int irReceiverPin, long frequency) {
-  tone(irLedPin, frequency, 8); // Emit IR for 8ms
-  delay(1);
-  int ir = digitalRead(irReceiverPin);
-  delay(1);
-  return ir; // 0 = detection, 1 = no detection
+  // Standard BOE-Bot IR detection method:
+  // 1. Generate 38kHz square wave on IR LED pin for 8ms
+  // 2. IR light bounces off obstacle and returns to receiver
+  // 3. IR receiver (TSOP-style) outputs LOW when detecting 38kHz IR
+  //
+  // IMPORTANT: This requires proper hardware setup:
+  // - IR LED with current-limiting resistor (220-330 ohm)
+  // - 38kHz IR receiver (like TSOP38238, TSOP4838, etc.)
+  // - IR LED and receiver pointing in SAME direction (for reflection)
+
+  tone(irLedPin, frequency, 8); // Emit 38kHz IR for 8ms
+  delay(1);                      // Wait for detection
+  int ir = digitalRead(irReceiverPin);  // Read receiver
+  delay(1);                      // Cooldown
+  return ir;  // 0 = object detected (IR reflected back), 1 = no detection
 }
 
 void updateGyroscope() {
