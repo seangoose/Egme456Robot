@@ -76,6 +76,8 @@
 
 // Color sensor thresholds
 #define BLACK_THRESHOLD 600       // Duration above this = black surface
+#define COLOR_STABILIZE_MS 20     // Reduced stabilization delay (was 50ms)
+#define PULSEIN_TIMEOUT 30000     // Timeout for pulseIn (30ms)
 
 // ==================== GLOBAL OBJECTS ====================
 Servo servoLeft, servoRight;
@@ -118,6 +120,21 @@ float gyroHeading = 0.0;
 // Safety flags
 bool positionUncertain = false;
 
+// Phase completion tracking (for adaptive transitions)
+bool phase1Complete = false;
+
+// Cached color sensor readings (for efficiency)
+unsigned long lastRedReading = 0;
+unsigned long lastBlueReading = 0;
+unsigned long lastColorReadTime = 0;
+#define COLOR_CACHE_VALID_MS 50  // Cache valid for 50ms
+
+// Watchdog for sweep loops (prevent getting stuck)
+unsigned long lastSweepProgress = 0;
+float lastWatchdogY = 0;
+#define WATCHDOG_TIMEOUT_MS 5000  // 5 seconds without progress = stuck
+#define WATCHDOG_MIN_PROGRESS 1.0 // Must move at least 1" to count as progress
+
 // ==================== FUNCTION PROTOTYPES ====================
 // Movement primitives
 void maneuver(int speedLeft, int speedRight, int msTime);
@@ -135,7 +152,9 @@ void navigateToCoordinate(float target_X, float target_Y);
 
 // Sensor reading
 unsigned long measureColorDuration(bool readRed);
+void readColorSensorCached(unsigned long &red, unsigned long &blue);
 bool detectBlackBoundary();
+bool detectBlackBoundaryFast();
 int checkFieldSide();
 bool scanForOpponent();
 void updateGyroscope();
@@ -159,6 +178,8 @@ void recoverPosition();
 void statusBeep(int frequency, int duration);
 float normalizeAngle(float angle);
 int irDetect(int irLedPin, int irReceiverPin, long frequency);
+bool checkWatchdog();
+void resetWatchdog();
 
 // ==================== SETUP ====================
 void setup() {
@@ -313,13 +334,15 @@ void loop() {
   bool opponentDetected = scanForOpponent();
   bool atBoundary = detectBlackBoundary();
 
-  // 3. Phase management
+  // 3. Phase management (adaptive based on completion and time)
   if(elapsed < 5) {
     currentPhase = INIT;
-  } else if(elapsed < 35) {
+  } else if(elapsed < 35 && !phase1Complete) {
+    // Offensive phase: continue until all 4 passes done OR time limit
     currentPhase = OFFENSIVE;
   } else {
-    currentPhase = DEFENSIVE; // Continues until 60 seconds
+    // Defensive phase: either Phase 1 complete or time expired
+    currentPhase = DEFENSIVE;
   }
 
   // 4. Time limit enforcement (60 seconds)
@@ -390,7 +413,10 @@ void loop() {
   }
 
   // 8. Position verification (every 3 seconds)
-  if(elapsed % 3 == 0 && elapsed > 0) {
+  static unsigned long lastPositionCheck = 0;
+  if(currentTime - lastPositionCheck > 3000 && elapsed > 5) {
+    lastPositionCheck = currentTime;
+
     int fieldSide = checkFieldSide();
     if(fieldSide != 0) {
       bool expectedOnOwnSide = (colorSensor_Y < 24.0);
@@ -399,9 +425,14 @@ void loop() {
       if(expectedOnOwnSide != actuallyOnOwnSide) {
         positionUncertain = true;
         #if DEBUG_MODE
-          Serial.println("WARNING: Position uncertain");
+          Serial.println("WARNING: Position uncertain - initiating recovery");
         #endif
       }
+    }
+
+    // Execute recovery if position is uncertain
+    if(positionUncertain) {
+      recoverPosition();
     }
   }
 
@@ -576,6 +607,11 @@ void navigateToCoordinate(float target_X, float target_Y) {
   float targetHeading = atan2(deltaX, deltaY) * 180.0 / PI;
   float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
 
+  // Skip navigation if already at target (within tolerance)
+  if(distance < 2.0) {
+    return;
+  }
+
   #if DEBUG_MODE
     Serial.print("Navigate: Current("); Serial.print(colorSensor_X, 1);
     Serial.print(","); Serial.print(colorSensor_Y, 1);
@@ -587,11 +623,46 @@ void navigateToCoordinate(float target_X, float target_Y) {
 
   // Rotate to target heading
   rotateToHeading(targetHeading);
-  delay(200);
+  delay(100);
 
-  // Move forward
-  moveForward(distance);
-  delay(200);
+  // Move forward with opponent detection
+  int duration = (int)(distance / SPEED_INCHES_PER_SEC * 1000.0);
+  unsigned long startMove = millis();
+
+  while(millis() - startMove < duration) {
+    // Check for opponent during navigation
+    if(scanForOpponent()) {
+      #if DEBUG_MODE
+        Serial.println("Opponent detected during navigation!");
+      #endif
+      stopMotors();
+      evadeOpponent();
+      return; // Re-plan navigation after evasion
+    }
+
+    updateGyroscope();
+
+    // Calculate heading error
+    float headingError = normalizeAngle(heading - targetHeading);
+
+    // Apply correction
+    int correction = (int)(headingError * 2.5);
+    correction = constrain(correction, -50, 50);
+
+    maneuver(SERVO_FULL_SPEED - correction, SERVO_FULL_SPEED + correction, 50);
+    updatePositionFromMovement(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 50);
+
+    // Safety check for boundary
+    if(detectBlackBoundaryFast()) {
+      #if DEBUG_MODE
+        Serial.println("Boundary detected during navigation!");
+      #endif
+      break;
+    }
+  }
+
+  stopMotors();
+  delay(100);
 }
 
 // ==================== SENSOR READING ====================
@@ -607,17 +678,45 @@ unsigned long measureColorDuration(bool readRed) {
     digitalWrite(PIN_COLOR_S3, HIGH);
   }
 
-  delay(50); // Stabilization delay
+  delay(COLOR_STABILIZE_MS); // Reduced stabilization delay
 
   // Read frequency as pulse duration
-  unsigned long duration = pulseIn(PIN_COLOR_OUT, LOW, 50000);
+  unsigned long duration = pulseIn(PIN_COLOR_OUT, LOW, PULSEIN_TIMEOUT);
+
+  // CRITICAL FIX: pulseIn returns 0 on timeout, NOT a high value
+  // Timeout indicates no pulse received = very dark surface (black)
+  // Return a high value to indicate black detection
+  if(duration == 0) {
+    duration = BLACK_THRESHOLD + 200; // Treat timeout as black
+  }
 
   return duration;
 }
 
+// Optimized color reading with caching
+void readColorSensorCached(unsigned long &red, unsigned long &blue) {
+  unsigned long now = millis();
+
+  // Return cached values if still valid
+  if(now - lastColorReadTime < COLOR_CACHE_VALID_MS && lastColorReadTime > 0) {
+    red = lastRedReading;
+    blue = lastBlueReading;
+    return;
+  }
+
+  // Read new values
+  red = measureColorDuration(true);
+  blue = measureColorDuration(false);
+
+  // Cache the readings
+  lastRedReading = red;
+  lastBlueReading = blue;
+  lastColorReadTime = now;
+}
+
 bool detectBlackBoundary() {
-  unsigned long red = measureColorDuration(true);
-  unsigned long blue = measureColorDuration(false);
+  unsigned long red, blue;
+  readColorSensorCached(red, blue);
 
   // Black border: BOTH colors show very low intensity (high duration)
   bool isBlack = (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD);
@@ -625,10 +724,24 @@ bool detectBlackBoundary() {
   return isBlack;
 }
 
+// Fast boundary check without reading sensor (uses cached values)
+bool detectBlackBoundaryFast() {
+  // Only use cached values if recent
+  if(millis() - lastColorReadTime < COLOR_CACHE_VALID_MS && lastColorReadTime > 0) {
+    return (lastRedReading > BLACK_THRESHOLD && lastBlueReading > BLACK_THRESHOLD);
+  }
+  // Fall back to full read
+  return detectBlackBoundary();
+}
+
 int checkFieldSide() {
   // Returns: 1 = own side, -1 = opponent side, 0 = boundary/uncertain
 
-  if(detectBlackBoundary()) {
+  unsigned long red, blue;
+  readColorSensorCached(red, blue);
+
+  // Check for black boundary first (uses same cached values)
+  if(red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD) {
     return 0; // At boundary, can't determine side
   }
 
@@ -779,6 +892,10 @@ void executePhase1_OffensiveSweep() {
   // Lanes at X = 6", 18", 30", 42"
 
   if(completedOffensivePasses >= 4) {
+    phase1Complete = true; // Signal transition to Phase 2
+    #if DEBUG_MODE
+      Serial.println("Phase 1 COMPLETE - transitioning to defensive");
+    #endif
     return; // All offensive passes complete
   }
 
@@ -814,6 +931,9 @@ void executePhase1_OffensiveSweep() {
       Serial.println("Executing offensive sweep...");
     #endif
 
+    // Reset watchdog for this sweep
+    resetWatchdog();
+
     while(colorSensor_Y < 38.0) {
       // Check for opponent
       if(scanForOpponent()) {
@@ -823,10 +943,21 @@ void executePhase1_OffensiveSweep() {
       }
 
       // Check for boundary (safety)
-      if(detectBlackBoundary()) {
+      if(detectBlackBoundaryFast()) {
         #if DEBUG_MODE
           Serial.println("Boundary detected - stopping sweep");
         #endif
+        break;
+      }
+
+      // Check watchdog (stuck detection)
+      if(checkWatchdog()) {
+        #if DEBUG_MODE
+          Serial.println("Watchdog triggered - aborting sweep");
+        #endif
+        statusBeep(1000, 200);
+        // Back up and try to recover
+        moveBackward(4.0);
         break;
       }
 
@@ -866,38 +997,68 @@ void executePhase1_OffensiveSweep() {
 }
 
 void executePhase2_DefensiveClearing() {
-  // Continuous serpentine sweeping on own side until match end
-  // Sweep forward → shift → backward → shift → repeat
+  // Aggressive defensive sweeping: push cubes from own side TOWARD opponent
+  // Strategy: Sweep forward from near back boundary past midfield, then return
+  // This pushes any cubes on our side toward opponent territory
 
   static bool isInitialized = false;
+  static bool returningSweep = false;
+
+  // Defensive sweep boundaries (more aggressive than before)
+  const float DEFENSE_START_Y = 8.0;   // Start near back boundary
+  const float DEFENSE_END_Y = 28.0;    // Push past midfield (24") into opponent territory
 
   if(!isInitialized) {
     // Initialize defensive phase
     currentLane = 1;
-    sweepingForward = true;
+    returningSweep = false;
 
     #if DEBUG_MODE
-      Serial.println("Phase 2: Defensive clearing initiated");
+      Serial.println("Phase 2: AGGRESSIVE defensive clearing initiated");
     #endif
 
-    // Navigate to starting position (lane 1, own side)
-    navigateToCoordinate(6.0, 12.0);
+    // Navigate to starting position (lane 1, near back boundary)
+    navigateToCoordinate(6.0, DEFENSE_START_Y);
     rotateToHeading(0.0);
     deployArms();
 
     isInitialized = true;
   }
 
-  // Execute continuous sweeping
-  if(sweepingForward) {
-    // Forward sweep from Y~12" to Y~22" (stay on own side)
+  if(!returningSweep) {
+    // FORWARD SWEEP: Push cubes from own side toward opponent (Y increasing)
+    // This is the aggressive part - moving forward pushes cubes
 
-    while(colorSensor_Y < 22.0 && !detectBlackBoundary()) {
+    // Reset watchdog for this sweep
+    resetWatchdog();
+
+    while(colorSensor_Y < DEFENSE_END_Y) {
+      // Check for opponent
       if(scanForOpponent()) {
+        statusBeep(4000, 100);
         evadeOpponent();
-        return;
+        return; // Re-enter function after evasion
       }
 
+      // Check for boundary (safety)
+      if(detectBlackBoundaryFast()) {
+        #if DEBUG_MODE
+          Serial.println("Boundary detected during defensive sweep");
+        #endif
+        break;
+      }
+
+      // Check watchdog (stuck detection)
+      if(checkWatchdog()) {
+        #if DEBUG_MODE
+          Serial.println("Watchdog triggered in defensive sweep");
+        #endif
+        statusBeep(1000, 200);
+        moveBackward(4.0);
+        break;
+      }
+
+      // Move forward with gyroscope correction
       updateGyroscope();
       float headingError = normalizeAngle(heading - 0.0);
       int correction = (int)(headingError * 2.5);
@@ -905,11 +1066,17 @@ void executePhase2_DefensiveClearing() {
 
       maneuver(SERVO_FULL_SPEED - correction, SERVO_FULL_SPEED + correction, 100);
       updatePositionFromMovement(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 100);
-
-      if(detectBlackBoundary()) break;
     }
 
     stopMotors();
+
+    #if DEBUG_MODE
+      Serial.print("Defensive forward sweep complete at Y=");
+      Serial.println(colorSensor_Y);
+    #endif
+
+    // Prepare for return sweep (retract arms, move to next lane)
+    retractArms();
 
     // Shift to next lane
     currentLane++;
@@ -917,48 +1084,21 @@ void executePhase2_DefensiveClearing() {
 
     float nextLaneX = 6.0 + ((currentLane - 1) * 12.0);
 
-    retractArms();
-    navigateToCoordinate(nextLaneX, colorSensor_Y);
-    rotateToHeading(180.0); // Face backward for reverse sweep
+    // Navigate back toward own territory without sweeping
+    // (don't deploy arms during return - we don't want to pull cubes back!)
+    navigateToCoordinate(nextLaneX, DEFENSE_START_Y + 2.0);
+    rotateToHeading(0.0); // Face forward again
+
+    // Deploy arms for next sweep
     deployArms();
 
-    sweepingForward = false;
+    // Note: we DON'T set returningSweep=true because we want to
+    // always sweep FORWARD (pushing cubes away from our side)
+    // The "return" is just repositioning without active sweeping
 
-  } else {
-    // Backward sweep from Y~22" to Y~8"
-
-    while(colorSensor_Y > 8.0 && !detectBlackBoundary()) {
-      if(scanForOpponent()) {
-        evadeOpponent();
-        return;
-      }
-
-      updateGyroscope();
-      float headingError = normalizeAngle(heading - 180.0);
-      int correction = (int)(headingError * 2.5);
-      correction = constrain(correction, -50, 50);
-
-      maneuver(SERVO_FULL_SPEED - correction, SERVO_FULL_SPEED + correction, 100);
-      updatePositionFromMovement(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 100);
-
-      if(detectBlackBoundary()) break;
-    }
-
-    stopMotors();
-
-    // Shift to next lane
-    currentLane++;
-    if(currentLane > 4) currentLane = 1;
-
-    float nextLaneX = 6.0 + ((currentLane - 1) * 12.0);
-
-    retractArms();
-    navigateToCoordinate(nextLaneX, colorSensor_Y);
-    rotateToHeading(0.0); // Face forward for forward sweep
-    deployArms();
-
-    sweepingForward = true;
   }
+  // If somehow returningSweep got set, reset it
+  returningSweep = false;
 }
 
 // ==================== ERROR HANDLING ====================
@@ -967,24 +1107,83 @@ void handleBoundaryEmergency() {
   stopMotors();
   statusBeep(500, 300); // Low warning tone
 
+  // Retract arms for safety during emergency maneuver
+  ensureArmsRetracted();
+
   #if DEBUG_MODE
     Serial.print("BOUNDARY EMERGENCY at SensorY=");
-    Serial.println(colorSensor_Y);
+    Serial.print(colorSensor_Y);
+    Serial.print(" FrontY=");
+    Serial.println(getRobotFrontY());
   #endif
 
-  if(getRobotFrontY() > 45.0) {
-    // Near front boundary - reverse
-    moveBackward(6.0);
-  } else if(colorSensor_Y < 6.0) {
-    // Near back boundary - move forward
-    moveForward(4.0);
+  // Determine boundary type based on position estimate
+  if(getRobotFrontY() > 42.0) {
+    // Near front boundary (opponent's back edge)
+    #if DEBUG_MODE
+      Serial.println("Emergency: FRONT boundary - reversing");
+    #endif
+
+    // Aggressive reverse
+    maneuver(-SERVO_FULL_SPEED, -SERVO_FULL_SPEED, 800);
+    colorSensor_Y -= estimateDistance(800, SERVO_FULL_SPEED);
+
+    // Reset to safe position estimate
+    colorSensor_Y = 36.0; // Conservative estimate after retreat
+
+  } else if(colorSensor_Y < 8.0) {
+    // Near back boundary (own back edge)
+    #if DEBUG_MODE
+      Serial.println("Emergency: BACK boundary - advancing");
+    #endif
+
+    // Move forward
+    maneuver(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 600);
+    colorSensor_Y += estimateDistance(600, SERVO_FULL_SPEED);
+
+    // Reset to safe position estimate
+    colorSensor_Y = 10.0;
+
+  } else if(colorSensor_X < 8.0 || colorSensor_X > 40.0) {
+    // Near side boundary (left or right edge)
+    #if DEBUG_MODE
+      Serial.println("Emergency: SIDE boundary");
+    #endif
+
+    // Turn away from edge and move toward center
+    if(colorSensor_X < 24.0) {
+      // Near left edge - turn right
+      rotateRight(45.0);
+      moveForward(6.0);
+      rotateLeft(45.0);
+      colorSensor_X += 4.0; // Estimate position shift
+    } else {
+      // Near right edge - turn left
+      rotateLeft(45.0);
+      moveForward(6.0);
+      rotateRight(45.0);
+      colorSensor_X -= 4.0;
+    }
+
   } else {
-    // Unexpected boundary in middle - back away
-    moveBackward(4.0);
+    // Unexpected boundary in middle of field
+    // This is unusual - might be sensor error or major drift
+    #if DEBUG_MODE
+      Serial.println("Emergency: UNEXPECTED boundary - conservative retreat");
+    #endif
+
+    // Back away conservatively
+    moveBackward(6.0);
+
+    // Mark position as uncertain for recovery
+    positionUncertain = true;
   }
 
-  // Re-verify position
+  stopMotors();
   delay(200);
+
+  // Invalidate color sensor cache to get fresh reading
+  lastColorReadTime = 0;
 }
 
 void evadeOpponent() {
@@ -1019,6 +1218,80 @@ void evadeOpponent() {
   delay(300);
 }
 
+void recoverPosition() {
+  // Recovery procedure when position becomes uncertain
+  // Uses sensor fusion to re-establish coordinate system
+
+  #if DEBUG_MODE
+    Serial.println("Executing position recovery...");
+  #endif
+
+  stopMotors();
+  ensureArmsRetracted();
+
+  // Step 1: Check boundary proximity using color sensor
+  bool atBoundary = detectBlackBoundary();
+  int fieldSide = checkFieldSide();
+
+  if(atBoundary) {
+    // At a boundary - use this for position reset
+    #if DEBUG_MODE
+      Serial.println("Recovery: At boundary");
+    #endif
+
+    if(colorSensor_Y > 30.0) {
+      // Probably at front boundary (opponent's back edge)
+      colorSensor_Y = 40.0; // Reset to known boundary position
+      moveBackward(6.0);    // Back away to safe zone
+    } else {
+      // Probably at back boundary (own back edge)
+      colorSensor_Y = 4.0;  // Reset to back boundary
+      moveForward(6.0);     // Move forward to safe zone
+    }
+
+  } else if(fieldSide != 0) {
+    // On colored field, can verify position
+    bool expectedOnOwnSide = (colorSensor_Y < 24.0);
+    bool actuallyOnOwnSide = (fieldSide == 1);
+
+    if(expectedOnOwnSide != actuallyOnOwnSide) {
+      // Position is wrong - crossed midfield unexpectedly
+      #if DEBUG_MODE
+        Serial.println("Recovery: Wrong side of field");
+      #endif
+
+      if(actuallyOnOwnSide && !expectedOnOwnSide) {
+        // We're on own side but thought we were on opponent's
+        // We've drifted back - adjust Y estimate
+        colorSensor_Y = 18.0; // Assume middle of own territory
+      } else {
+        // We're on opponent's side but thought we were on own
+        // We've penetrated too far - retreat
+        colorSensor_Y = 30.0;
+        moveBackward(8.0);
+      }
+    }
+  }
+
+  // Step 2: Re-zero heading using gyroscope
+  // Assume we should be facing forward (0°) after recovery
+  float headingOffset = heading;
+  if(abs(headingOffset) > 10.0) {
+    // Significant heading drift - correct it
+    rotateToHeading(0.0);
+  }
+
+  // Clear uncertainty flag
+  positionUncertain = false;
+
+  #if DEBUG_MODE
+    Serial.print("Recovery complete. New position: X=");
+    Serial.print(colorSensor_X);
+    Serial.print(" Y=");
+    Serial.println(colorSensor_Y);
+  #endif
+}
+
 // ==================== UTILITY FUNCTIONS ====================
 
 void statusBeep(int frequency, int duration) {
@@ -1031,4 +1304,33 @@ float normalizeAngle(float angle) {
   while(angle > 180.0) angle -= 360.0;
   while(angle < -180.0) angle += 360.0;
   return angle;
+}
+
+// Watchdog check: returns true if robot appears stuck (no Y progress)
+bool checkWatchdog() {
+  unsigned long now = millis();
+
+  // Check if we've made progress
+  if(abs(colorSensor_Y - lastWatchdogY) >= WATCHDOG_MIN_PROGRESS) {
+    // Made progress - reset watchdog
+    lastSweepProgress = now;
+    lastWatchdogY = colorSensor_Y;
+    return false;
+  }
+
+  // Check if watchdog timeout exceeded
+  if(now - lastSweepProgress > WATCHDOG_TIMEOUT_MS) {
+    #if DEBUG_MODE
+      Serial.println("WATCHDOG: Robot appears stuck!");
+    #endif
+    return true;
+  }
+
+  return false;
+}
+
+// Reset watchdog (call at start of new sweep)
+void resetWatchdog() {
+  lastSweepProgress = millis();
+  lastWatchdogY = colorSensor_Y;
 }
