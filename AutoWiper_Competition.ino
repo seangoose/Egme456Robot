@@ -218,16 +218,41 @@ void setup() {
 
   #if TEST_SENSORS_ONLY
     // Test mode - just display sensor readings
+    Serial.println("=== SENSOR TEST MODE ===");
+    Serial.println("Color Sensor: Lower value = more reflection");
+    Serial.println("IR: 0=detected, 1=clear");
+    Serial.println();
+
     while(true) {
       unsigned long red = measureColorDuration(true);
       unsigned long blue = measureColorDuration(false);
       bool black = detectBlackBoundary();
       bool opponent = scanForOpponent();
 
+      // Determine surface color (INVERTED LOGIC for this sensor)
+      String surfaceColor = "UNKNOWN";
+      if(black) {
+        surfaceColor = "BLACK";
+      } else if(red > blue) {
+        surfaceColor = "RED (red=" + String(red) + " > blue=" + String(blue) + ")";
+      } else {
+        surfaceColor = "BLUE (blue=" + String(blue) + " > red=" + String(red) + ")";
+      }
+
       Serial.print("Red: "); Serial.print(red);
       Serial.print(" | Blue: "); Serial.print(blue);
-      Serial.print(" | Black: "); Serial.print(black);
-      Serial.print(" | Opponent: "); Serial.println(opponent);
+      Serial.print(" | Surface: "); Serial.print(surfaceColor);
+      Serial.print(" | IR: "); Serial.print(opponent ? "CLEAR" : "DETECTED");
+
+      // Try to read gyroscope
+      sensors_event_t accel, gyro, temp;
+      if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
+        Serial.print(" | GyroZ: "); Serial.print(gyro.gyro.z, 3);
+      } else {
+        Serial.print(" | Gyro: FAIL");
+      }
+
+      Serial.println();
       delay(500);
     }
   #endif
@@ -239,7 +264,8 @@ void setup() {
 
   if(red < 600 && blue < 600) {
     // On colored surface (not black boundary)
-    startedOnRedSide = (red < blue); // Red side if red reflects more
+    // INVERTED: Higher duration = that color surface (counterintuitive but matches hardware)
+    startedOnRedSide = (red > blue); // Red side if red shows higher duration
   } else {
     // Starting on black boundary - assume positioned correctly
     startedOnRedSide = false; // Default assumption
@@ -388,7 +414,21 @@ void loop() {
       Serial.print(" | SensorY:"); Serial.print(colorSensor_Y, 1);
       Serial.print(" | FrontY:"); Serial.print(getRobotFrontY(), 1);
       Serial.print(" | X:"); Serial.print(colorSensor_X, 1);
-      Serial.print(" | H:"); Serial.println(heading, 1);
+      Serial.print(" | H:"); Serial.print(heading, 1);
+
+      // Add gyroscope reading
+      sensors_event_t accel, gyro, temp;
+      if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
+        Serial.print(" | GyroZ:"); Serial.print(gyro.gyro.z, 2);
+      }
+
+      // Add color sensor reading
+      unsigned long red = measureColorDuration(true);
+      unsigned long blue = measureColorDuration(false);
+      Serial.print(" | R:"); Serial.print(red);
+      Serial.print(" | B:"); Serial.print(blue);
+
+      Serial.println();
       lastDebug = currentTime;
     }
   #endif
@@ -595,7 +635,8 @@ int checkFieldSide() {
   unsigned long red = measureColorDuration(true);
   unsigned long blue = measureColorDuration(false);
 
-  bool readingRed = (red < blue);
+  // INVERTED: Higher duration = that color surface (matches hardware behavior)
+  bool readingRed = (red > blue);
 
   // Compare with starting field color
   if(readingRed == startedOnRedSide) {
