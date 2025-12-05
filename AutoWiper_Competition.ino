@@ -241,11 +241,13 @@ void setup() {
   digitalWrite(PIN_LED_1, LOW);
 
   #if TEST_SENSORS_ONLY
-    // Test mode - just display sensor readings with interpretation
+    // Test mode - display all sensor readings with interpretation
     Serial.println("\n=== SENSOR TEST MODE ===");
-    Serial.println("Lower duration = MORE light reflected");
-    Serial.println("Red < Blue = RED surface | Blue < Red = BLUE surface");
-    Serial.println("Both > 600 = BLACK boundary\n");
+    Serial.println("Color: Lower duration = MORE light reflected");
+    Serial.println("       Red < Blue = RED surface (correct for TCS3200)");
+    Serial.println("       Both > 600 = BLACK boundary");
+    Serial.println("IR: 0 = opponent detected, 1 = clear");
+    Serial.println();
 
     while(true) {
       unsigned long red = measureColorDuration(true);
@@ -256,19 +258,35 @@ void setup() {
       Serial.print("Red: "); Serial.print(red);
       Serial.print(" | Blue: "); Serial.print(blue);
 
-      // Show interpretation
+      // Show surface interpretation (CORRECT LOGIC: lower = more reflection)
       Serial.print(" | Surface: ");
       if(black) {
         Serial.print("BLACK");
       } else if(red < blue) {
+        // Lower red duration = more red light reflected = RED surface
         Serial.print("RED");
       } else {
+        // Lower blue duration = more blue light reflected = BLUE surface
         Serial.print("BLUE");
       }
 
-      Serial.print(" | Opponent: ");
-      Serial.println(opponent == 0 ? "DETECTED" : "none");
+      // Opponent detection
+      Serial.print(" | IR: ");
+      Serial.print(opponent == 0 ? "DETECTED" : "clear");
 
+      // Gyroscope test (if available)
+      if(gyroAvailable) {
+        sensors_event_t accel, gyro, temp;
+        if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
+          Serial.print(" | GyroZ: "); Serial.print(gyro.gyro.z, 2);
+        } else {
+          Serial.print(" | Gyro: READ_FAIL");
+        }
+      } else {
+        Serial.print(" | Gyro: N/A");
+      }
+
+      Serial.println();
       delay(500);
     }
   #endif
