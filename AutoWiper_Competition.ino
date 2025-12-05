@@ -34,13 +34,10 @@
 #define PIN_COLOR_S2 5
 #define PIN_COLOR_S3 A0  // Analog pin used as digital output
 
-// IR Sensors (Opponent detection ONLY, not boundaries)
-// WARNING: Pin 1 is Serial TX - IR2 won't work when DEBUG_MODE or TEST_SENSORS_ONLY is enabled!
-// For testing, use only IR pair 1 (pins 8,9) or disable Serial debugging
-#define PIN_IR_LED_1 9
-#define PIN_IR_RX_1 8
-#define PIN_IR_LED_2 2
-#define PIN_IR_RX_2 1    // CAUTION: Conflicts with Serial TX when debugging enabled!
+// Ultrasonic Sensor (3-pin HC-SR04 style) - TO BE CONFIGURED
+// Will replace IR sensors for opponent detection
+// #define PIN_ULTRASONIC_TRIG 9
+// #define PIN_ULTRASONIC_ECHO 8
 
 // I2C addresses for LSM6DSOX gyroscope (A4=SDA, A5=SCL on Arduino Uno)
 #define LSM6DSOX_ADDR_PRIMARY 0x6A   // Default address (SA0 pin LOW or floating)
@@ -92,9 +89,10 @@ Adafruit_LSM6DSOX lsm6ds;
 
 // ==================== GLOBAL STATE VARIABLES ====================
 // Position tracking - COLOR SENSOR POSITION (at REAR of robot)
-float colorSensor_X = 24.0;  // Start at center of field
-float colorSensor_Y = 2.0;   // Start at back boundary
-float heading = 0.0;         // Degrees (0 = forward into field)
+// Robot starts in MIDDLE of field (near midfield line), facing toward center
+float colorSensor_X = 24.0;  // Start at center of field (X)
+float colorSensor_Y = 20.0;  // Start near midfield (adjusted in setup based on color)
+float heading = 0.0;         // Degrees (0 = forward into opponent territory)
 
 // Derived position (robot extends 8" forward from sensor)
 float getRobotFrontY() { return colorSensor_Y + ROBOT_LENGTH; }
@@ -163,7 +161,6 @@ void readColorSensorCached(unsigned long &red, unsigned long &blue);
 bool detectBlackBoundary();
 bool detectBlackBoundaryFast();
 int checkFieldSide();
-bool scanForOpponent();
 void updateGyroscope();
 
 // Arm control
@@ -172,19 +169,16 @@ void retractArms();
 void ensureArmsRetracted();
 
 // Strategy execution
-void calibrateCoordinateSystem();
 void executePhase1_OffensiveSweep();
 void executePhase2_DefensiveClearing();
 
 // Error handling
 void handleBoundaryEmergency();
-void evadeOpponent();
 void recoverPosition();
 
 // Utilities
 void statusBeep(int frequency, int duration);
 float normalizeAngle(float angle);
-int irDetect(int irLedPin, int irReceiverPin, long frequency);
 bool checkWatchdog();
 void resetWatchdog();
 
@@ -214,13 +208,7 @@ void setup() {
   pinMode(PIN_COLOR_S2, OUTPUT);
   pinMode(PIN_COLOR_S3, OUTPUT);
 
-  // 5. IR sensor pins (opponent detection only)
-  pinMode(PIN_IR_LED_1, OUTPUT);
-  pinMode(PIN_IR_RX_1, INPUT);
-  pinMode(PIN_IR_LED_2, OUTPUT);
-  pinMode(PIN_IR_RX_2, INPUT);
-
-  // 6. Debug outputs
+  // 5. Debug outputs
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_LED_1, OUTPUT);
   pinMode(PIN_LED_2, OUTPUT);
@@ -262,80 +250,109 @@ void setup() {
     #endif
   }
 
-  #if DEBUG_MODE || TEST_SENSORS_ONLY
-    Serial.println(F("IR2 off (pin1=TX)"));
-  #endif
-
-  // 8. MANDATORY 2-SECOND DELAY (competition requirement)
+  // 6. MANDATORY 2-SECOND DELAY (competition requirement)
   statusBeep(3000, 500);
   digitalWrite(PIN_LED_1, HIGH);
   delay(2000);
   digitalWrite(PIN_LED_1, LOW);
 
   #if TEST_SENSORS_ONLY
-    // Compact test mode - minimal strings to save flash
+    // Test mode - Color sensor and Gyroscope
     // Color: low=more light. R<B=red, both>600=black
-    // IR: 0=detected, 1=clear
+    // Gyro: Shows raw Z rate (rad/s) and integrated heading (deg)
     Serial.println(F("TEST MODE"));
     Serial.println(F("R<B=red Both>600=black"));
-    Serial.print(F("IR1 idle:")); Serial.println(digitalRead(PIN_IR_RX_1));
+    Serial.println(F("Rotate robot to test gyro heading"));
+
+    // Initialize heading tracking for test mode
+    float testHeading = 0.0;
+    unsigned long lastTestUpdate = millis();
 
     while(true) {
       unsigned long red = measureColorDuration(true);
       unsigned long blue = measureColorDuration(false);
-      int ir1 = irDetect(PIN_IR_LED_1, PIN_IR_RX_1, 38000);
 
-      // Compact output: R:xxx B:xxx [surface] IR:x G:x.xx
+      // Color output
       Serial.print(F("R:")); Serial.print(red);
       Serial.print(F(" B:")); Serial.print(blue);
       Serial.print((red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD) ? F(" BLK") : (red < blue ? F(" RED") : F(" BLU")));
-      Serial.print(F(" IR:")); Serial.print(ir1 == 0 ? F("DET") : F("clr"));
 
+      // Gyroscope output with heading integration
       if(gyroAvailable) {
         sensors_event_t accel, gyro, temp;
         if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
-          Serial.print(F(" G:")); Serial.print(gyro.gyro.z, 2);
+          // Calculate dt and integrate heading
+          unsigned long now = millis();
+          float dt = (now - lastTestUpdate) / 1000.0;
+          lastTestUpdate = now;
+
+          // Integrate gyro Z to get heading change
+          // gyro.gyro.z is in rad/s, convert to deg/s
+          float gyroZ_degPerSec = gyro.gyro.z * (180.0 / PI);
+          testHeading += gyroZ_degPerSec * dt;
+
+          // Normalize heading to -180 to +180
+          while(testHeading > 180.0) testHeading -= 360.0;
+          while(testHeading < -180.0) testHeading += 360.0;
+
+          Serial.print(F(" Gz:")); Serial.print(gyroZ_degPerSec, 1);
+          Serial.print(F(" H:")); Serial.print(testHeading, 1);
         }
       } else {
-        Serial.print(F(" G:N/A"));
+        Serial.print(F(" Gyro:N/A"));
       }
       Serial.println();
-      delay(500);
+      delay(100); // Faster updates for gyro responsiveness
     }
   #endif
 
-  // 9. Determine starting field color (RED or BLUE side)
+  // 7. Determine starting position based on field color
+  // Robot starts in MIDDLE of field, facing toward center (opponent territory)
   delay(100);
   unsigned long red = measureColorDuration(true);
   unsigned long blue = measureColorDuration(false);
 
   if(red < 600 && blue < 600) {
     // On colored surface (not black boundary)
-    startedOnRedSide = (red < blue); // Red side if red reflects more
+    startedOnRedSide = (red < blue); // Red side if red reflects more (lower duration)
+
+    // Set initial Y position based on which side we're on
+    // Robot is placed in middle area, facing forward
+    if(startedOnRedSide) {
+      // On red side (our territory) - sensor Y is before midfield
+      colorSensor_Y = 18.0;  // Slightly behind midfield
+    } else {
+      // On blue side (opponent territory) - we're past midfield
+      colorSensor_Y = 26.0;  // Slightly past midfield
+    }
   } else {
-    // Starting on black boundary - assume positioned correctly
-    startedOnRedSide = false; // Default assumption
+    // Starting on black boundary - assume near midfield
+    colorSensor_Y = 22.0;
+    startedOnRedSide = true; // Default assumption
   }
 
   #if DEBUG_MODE
     Serial.print(F("Side:")); Serial.println(startedOnRedSide ? F("RED") : F("BLU"));
+    Serial.print(F("StartY:")); Serial.println(colorSensor_Y);
   #endif
 
-  // 10. Initial boundary calibration
-  calibrateCoordinateSystem();
-
-  // 11. Zero gyroscope heading
+  // 8. Zero gyroscope heading
+  // Assume robot is facing forward (heading = 0) toward opponent territory
   gyroHeading = 0.0;
   heading = 0.0;
   lastGyroUpdate = millis();
 
-  // 12. Retract arms to starting width (4.75")
+  #if DEBUG_MODE
+    Serial.println(F("Gyro zeroed, H=0"));
+  #endif
+
+  // 9. Retract arms to starting width (4.75")
   retractArms();
 
-  // 13. Record start time
+  // 10. Record start time
   startTime = millis();
 
-  // 14. Ready indication
+  // 11. Ready indication
   statusBeep(2000, 200);
   digitalWrite(PIN_LED_1, HIGH);
 
@@ -353,7 +370,6 @@ void loop() {
 
   // 2. Update sensors
   updateGyroscope();
-  bool opponentDetected = scanForOpponent();
   bool atBoundary = detectBlackBoundary();
 
   // 3. Phase management (adaptive based on completion and time)
@@ -402,16 +418,7 @@ void loop() {
     }
   }
 
-  // 6. Opponent avoidance (HIGH PRIORITY)
-  if(opponentDetected && currentPhase != INIT) {
-    #if DEBUG_MODE
-      Serial.println(F("!OPP"));
-    #endif
-    evadeOpponent();
-    return;
-  }
-
-  // 7. Execute strategy phase
+  // 6. Execute strategy phase
   switch(currentPhase) {
     case INIT:
       // Initialization should be complete, prepare for offensive
@@ -627,21 +634,11 @@ void navigateToCoordinate(float target_X, float target_Y) {
   rotateToHeading(targetHeading);
   delay(100);
 
-  // Move forward with opponent detection
+  // Move forward with gyro correction
   int duration = (int)(distance / SPEED_INCHES_PER_SEC * 1000.0);
   unsigned long startMove = millis();
 
   while(millis() - startMove < duration) {
-    // Check for opponent during navigation
-    if(scanForOpponent()) {
-      #if DEBUG_MODE
-        Serial.println(F("!OPP"));
-      #endif
-      stopMotors();
-      evadeOpponent();
-      return;
-    }
-
     updateGyroscope();
 
     // Calculate heading error
@@ -757,39 +754,8 @@ int checkFieldSide() {
   }
 }
 
-bool scanForOpponent() {
-  // IR sensors detect opponent robot ONLY (not boundaries)
-  // NOTE: IR pair 2 (pins 1,2) conflicts with Serial TX when debugging!
-
-  int frontLeft = irDetect(PIN_IR_LED_1, PIN_IR_RX_1, 38000);
-
-  // Only use IR pair 2 when Serial is NOT active (pins 0,1 free)
-  #if !DEBUG_MODE && !TEST_SENSORS_ONLY
-    int frontRight = irDetect(PIN_IR_LED_2, PIN_IR_RX_2, 38000);
-    return (frontLeft == 0 || frontRight == 0);
-  #else
-    // When debugging, only IR pair 1 works (pair 2 conflicts with Serial TX)
-    return (frontLeft == 0);
-  #endif
-}
-
-int irDetect(int irLedPin, int irReceiverPin, long frequency) {
-  // Standard BOE-Bot IR detection method:
-  // 1. Generate 38kHz square wave on IR LED pin for 8ms
-  // 2. IR light bounces off obstacle and returns to receiver
-  // 3. IR receiver (TSOP-style) outputs LOW when detecting 38kHz IR
-  //
-  // IMPORTANT: This requires proper hardware setup:
-  // - IR LED with current-limiting resistor (220-330 ohm)
-  // - 38kHz IR receiver (like TSOP38238, TSOP4838, etc.)
-  // - IR LED and receiver pointing in SAME direction (for reflection)
-
-  tone(irLedPin, frequency, 8); // Emit 38kHz IR for 8ms
-  delay(1);                      // Wait for detection
-  int ir = digitalRead(irReceiverPin);  // Read receiver
-  delay(1);                      // Cooldown
-  return ir;  // 0 = object detected (IR reflected back), 1 = no detection
-}
+// Gyroscope deadband - ignore noise below this threshold (deg/s)
+#define GYRO_DEADBAND 0.5
 
 void updateGyroscope() {
   // Skip if gyroscope not available - rely on dead reckoning
@@ -807,11 +773,15 @@ void updateGyroscope() {
   float dt = (currentTime - lastGyroUpdate) / 1000.0; // Convert to seconds
 
   if(dt > 0.001 && dt < 1.0) { // Sanity check
-    float gyroZ = gyro.gyro.z; // Z-axis rotation in rad/s
+    // gyro.gyro.z is in rad/s, convert to deg/s
+    float gyroZ_degPerSec = gyro.gyro.z * (180.0 / PI);
 
-    // Integrate to get heading
-    heading += gyroZ * dt * (180.0 / PI); // Convert to degrees
-    heading = normalizeAngle(heading);
+    // Apply deadband to reduce drift from sensor noise
+    if(abs(gyroZ_degPerSec) > GYRO_DEADBAND) {
+      // Integrate to get heading change
+      heading += gyroZ_degPerSec * dt;
+      heading = normalizeAngle(heading);
+    }
   }
 
   lastGyroUpdate = currentTime;
@@ -849,35 +819,6 @@ void ensureArmsRetracted() {
 
 // ==================== STRATEGY EXECUTION ====================
 
-void calibrateCoordinateSystem() {
-  #if DEBUG_MODE
-    Serial.println(F("CAL"));
-  #endif
-
-  bool blackDetected = false;
-  int attempts = 0;
-
-  while(!blackDetected && attempts < 10) {
-    if(detectBlackBoundary()) {
-      blackDetected = true;
-      break;
-    }
-    maneuver(-100, -100, 100);
-    colorSensor_Y -= estimateDistance(100, 100);
-    attempts++;
-    delay(50);
-  }
-
-  colorSensor_Y = 2.0;
-  #if DEBUG_MODE
-    Serial.println(blackDetected ? F("CAL OK") : F("CAL DEF"));
-  #endif
-
-  maneuver(150, 150, 300);
-  colorSensor_Y += estimateDistance(300, 150);
-  stopMotors();
-}
-
 void executePhase1_OffensiveSweep() {
   // Execute 4 sweeping passes across opponent's territory
   // Lanes at X = 6", 18", 30", 42"
@@ -914,11 +855,6 @@ void executePhase1_OffensiveSweep() {
     resetWatchdog();
 
     while(colorSensor_Y < 38.0) {
-      if(scanForOpponent()) {
-        statusBeep(4000, 100);
-        evadeOpponent();
-        break;
-      }
       if(detectBlackBoundaryFast()) {
         #if DEBUG_MODE
           Serial.println(F("!BND"));
@@ -976,11 +912,6 @@ void executePhase2_DefensiveClearing() {
   if(!returningSweep) {
     resetWatchdog();
     while(colorSensor_Y < DEFENSE_END_Y) {
-      if(scanForOpponent()) {
-        statusBeep(4000, 100);
-        evadeOpponent();
-        return;
-      }
       if(detectBlackBoundaryFast()) {
         #if DEBUG_MODE
           Serial.println(F("!BND"));
@@ -1069,29 +1000,6 @@ void handleBoundaryEmergency() {
   stopMotors();
   delay(200);
   lastColorReadTime = 0;
-}
-
-void evadeOpponent() {
-  stopMotors();
-  statusBeep(4000, 100);
-  #if DEBUG_MODE
-    Serial.println(F("EVD"));
-  #endif
-  retractArms();
-  float distToLeftEdge = colorSensor_X - 6.0;
-  float distToRightEdge = 42.0 - colorSensor_X;
-  if(distToLeftEdge > distToRightEdge) {
-    moveBackward(4.0);
-    rotateLeft(90.0);
-    moveForward(10.0);
-    rotateRight(90.0);
-  } else {
-    moveBackward(4.0);
-    rotateRight(90.0);
-    moveForward(10.0);
-    rotateLeft(90.0);
-  }
-  delay(300);
 }
 
 void recoverPosition() {
