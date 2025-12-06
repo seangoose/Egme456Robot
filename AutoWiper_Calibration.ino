@@ -129,6 +129,7 @@ void runTest3_TurnCalibration();
 void runTest4_TravelingTurn();
 void runTest5_FieldNavigation();
 void runTest6_Ultrasonic();
+void runTest8_NavigationSequence();
 void displayCalibrationSummary();
 
 void maneuver(int speedLeft, int speedRight, int msTime);
@@ -238,6 +239,9 @@ void loop() {
       case '7':
         displayCalibrationSummary();
         break;
+      case '8':
+        runTest8_NavigationSequence();
+        break;
       case 'm':
       case 'M':
         displayMenu();
@@ -248,7 +252,7 @@ void loop() {
     }
 
     Serial.println();
-    Serial.println(F("Press 'm' for menu or enter test number (1-6)"));
+    Serial.println(F("Press 'm' for menu or enter test number (1-8)"));
   }
 
   delay(50);
@@ -269,11 +273,12 @@ void displayMenu() {
   Serial.println(F("║  5 - Full Field Navigation Test                                ║"));
   Serial.println(F("║  6 - Ultrasonic Sensor Verification                            ║"));
   Serial.println(F("║  7 - Display Calibration Summary (copy to competition code)    ║"));
+  Serial.println(F("║  8 - Navigation Sequence Test (Forward → Right 90° → Left 180°)║"));
   Serial.println(F("╠════════════════════════════════════════════════════════════════╣"));
   Serial.println(F("║  m - Show this menu                                            ║"));
   Serial.println(F("╚════════════════════════════════════════════════════════════════╝"));
   Serial.println();
-  Serial.println(F("Enter test number (1-7):"));
+  Serial.println(F("Enter test number (1-8):"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1222,6 +1227,157 @@ void runTest6_Ultrasonic() {
   Serial.println(F("(Setting threshold 2\" below max reliable range for safety)"));
 
   statusBeep(3000, 500);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TEST 8: NAVIGATION SEQUENCE TEST
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void runTest8_NavigationSequence() {
+  Serial.println(F("╔════════════════════════════════════════════════════════════════╗"));
+  Serial.println(F("║         TEST 8: NAVIGATION SEQUENCE TEST                       ║"));
+  Serial.println(F("╚════════════════════════════════════════════════════════════════╝"));
+  Serial.println();
+  Serial.println(F("This test performs a navigation sequence:"));
+  Serial.println(F("  1. Drive forward (you will specify distance)"));
+  Serial.println(F("  2. Turn right 90 degrees"));
+  Serial.println(F("  3. Turn left 180 degrees"));
+  Serial.println();
+
+  // Check if calibration data exists
+  if (turnLeft90ms == 0 || turnRight90ms == 0) {
+    Serial.println(F("WARNING: Run Test 3 first to calibrate turns!"));
+    Serial.println(F("Using default values (650ms)..."));
+    if (turnLeft90ms == 0) turnLeft90ms = 650;
+    if (turnRight90ms == 0) turnRight90ms = 650;
+  }
+
+  Serial.println(F("Current turn calibration:"));
+  Serial.print(F("  Turn left 90°: ")); Serial.print(turnLeft90ms); Serial.println(F("ms"));
+  Serial.print(F("  Turn right 90°: ")); Serial.print(turnRight90ms); Serial.println(F("ms"));
+  Serial.println();
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Ask for forward distance
+  // ─────────────────────────────────────────────────────────────────────────────
+  Serial.println(F("How far should the robot drive forward?"));
+  Serial.println(F("Enter distance in INCHES (e.g., 24 for 2 feet):"));
+
+  float forwardInches = readSerialFloat();
+
+  // Calculate movement duration based on calibration (if available)
+  unsigned int forwardTime;
+  if (distancePer1000ms_FullSpeed > 0) {
+    forwardTime = (unsigned int)(forwardInches / distancePer1000ms_FullSpeed * 1000.0);
+    Serial.print(F("Calculated forward time: ")); Serial.print(forwardTime);
+    Serial.println(F("ms (based on calibration)"));
+  } else {
+    // Estimate: assume 20 inches per second at full speed
+    forwardTime = (unsigned int)(forwardInches / 20.0 * 1000.0);
+    Serial.print(F("Estimated forward time: ")); Serial.print(forwardTime);
+    Serial.println(F("ms (using default 20\"/sec estimate)"));
+    Serial.println(F("WARNING: Run Test 2 for accurate distance calibration!"));
+  }
+  Serial.println();
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Ready to execute
+  // ─────────────────────────────────────────────────────────────────────────────
+  Serial.println(F("═══ READY TO EXECUTE NAVIGATION SEQUENCE ═══"));
+  Serial.println(F("Setup:"));
+  Serial.println(F("1. Place robot in starting position with clear space ahead"));
+  Serial.println(F("2. Ensure at least 3 feet of clearance in all directions"));
+  Serial.println(F("3. Mark starting position for reference"));
+  Serial.println();
+  Serial.println(F("Press ENTER when ready..."));
+  waitForSerialInput();
+
+  // Countdown
+  Serial.println(F("Starting in 3..."));
+  statusBeep(1000, 200);
+  delay(1000);
+  Serial.println(F("2..."));
+  statusBeep(1000, 200);
+  delay(1000);
+  Serial.println(F("1..."));
+  statusBeep(1000, 200);
+  delay(1000);
+  Serial.println(F("GO!"));
+  statusBeep(2000, 500);
+  delay(200);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // STEP 1: Drive Forward
+  // ─────────────────────────────────────────────────────────────────────────────
+  Serial.println();
+  Serial.print(F("STEP 1: Driving forward for ")); Serial.print(forwardTime); Serial.println(F("ms..."));
+
+  digitalWrite(PIN_LED_1, HIGH);
+  maneuver(SPEED_OFFSET, SPEED_OFFSET, forwardTime);
+  stopMotors();
+  digitalWrite(PIN_LED_1, LOW);
+
+  statusBeep(2000, 200);
+  delay(500);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // STEP 2: Turn Right 90°
+  // ─────────────────────────────────────────────────────────────────────────────
+  Serial.print(F("STEP 2: Turning RIGHT 90 degrees (")); Serial.print(turnRight90ms); Serial.println(F("ms)..."));
+
+  digitalWrite(PIN_LED_2, HIGH);
+
+  // Right turn: left wheel forward, right wheel backward
+  maneuver(SPEED_OFFSET, -SPEED_OFFSET, turnRight90ms);
+  stopMotors();
+
+  digitalWrite(PIN_LED_2, LOW);
+
+  statusBeep(2500, 200);
+  delay(500);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // STEP 3: Turn Left 180°
+  // ─────────────────────────────────────────────────────────────────────────────
+  unsigned int turnLeft180ms = turnLeft90ms * 2;  // 180° = 2 × 90°
+
+  Serial.print(F("STEP 3: Turning LEFT 180 degrees (")); Serial.print(turnLeft180ms); Serial.println(F("ms)..."));
+
+  digitalWrite(PIN_LED_1, HIGH);
+  digitalWrite(PIN_LED_2, HIGH);
+
+  // Left turn: left wheel backward, right wheel forward
+  maneuver(-SPEED_OFFSET, SPEED_OFFSET, turnLeft180ms);
+  stopMotors();
+
+  digitalWrite(PIN_LED_1, LOW);
+  digitalWrite(PIN_LED_2, LOW);
+
+  statusBeep(3000, 500);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // COMPLETE
+  // ─────────────────────────────────────────────────────────────────────────────
+  Serial.println();
+  Serial.println(F("═══════════════════════════════════════════════════════════════"));
+  Serial.println(F("NAVIGATION SEQUENCE COMPLETE!"));
+  Serial.println(F("═══════════════════════════════════════════════════════════════"));
+  Serial.println();
+  Serial.println(F("Summary of movements executed:"));
+  Serial.print(F("  1. Forward: ")); Serial.print(forwardInches); Serial.print(F("\" ("));
+  Serial.print(forwardTime); Serial.println(F("ms)"));
+  Serial.print(F("  2. Right turn: 90° (")); Serial.print(turnRight90ms); Serial.println(F("ms)"));
+  Serial.print(F("  3. Left turn: 180° (")); Serial.print(turnLeft180ms); Serial.println(F("ms)"));
+  Serial.println();
+  Serial.println(F("Final robot heading should be 90° LEFT of original orientation."));
+  Serial.println();
+
+  // Final celebration beeps
+  statusBeep(2000, 150);
+  delay(100);
+  statusBeep(2500, 150);
+  delay(100);
+  statusBeep(3000, 300);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
