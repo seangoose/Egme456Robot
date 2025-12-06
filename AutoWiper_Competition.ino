@@ -1,487 +1,697 @@
-/* ==========================================
-   AUTOWIPER MESSY ROOM COMPETITION CODE
-   EGME 456 - Cal State Fullerton
-   ==========================================
-   Hardware: Parallax BOE Shield-Bot + Arduino Uno
-   Strategy: Coordinate-based systematic sweeping
-   Match Duration: 60 seconds
+/* ═══════════════════════════════════════════════════════════════════════════════
+   AUTOWIPER COMPETITION CODE
+   EGME 456 - Cal State Fullerton Messy Room Competition
+   ═══════════════════════════════════════════════════════════════════════════════
 
-   CRITICAL: Color sensor mounted at REAR of robot
-            Robot extends 8" FORWARD from sensor position
-   ========================================== */
+   OBJECTIVE: Clear foam cubes from our half of 48"×48" field in 60 seconds.
+   VICTORY: Fewer cubes on our side than opponent at time expiration.
 
-// ==================== LIBRARIES ====================
+   STRATEGY:
+   - Phase 1: Detect which color (RED/BLUE) is our starting side
+   - Phase 2: Navigate to right side, turn to face opponent
+   - Phase 3: Execute multi-lane offensive sweeps pushing cubes into opponent territory
+
+   CRITICAL DESIGN DECISIONS:
+   - Position tracked in SERVO TURN UNITS (time-based), not theoretical inches
+   - NO reliance on gyroscope (use calibrated turn timing instead)
+   - Continuous boundary monitoring in ALL movement functions
+   - Separate calibration constants for left and right turns
+   - Color sensor is PRIMARY navigation tool
+
+   HARDWARE CONFIGURATION (VERIFIED - DO NOT CHANGE):
+   - D13: Left drive servo (Parallax continuous rotation)
+   - D12: Right drive servo (Parallax continuous rotation)
+   - D11: Left arm servo (Standard hobby)
+   - D10: Right arm servo (Standard hobby)
+   - D4:  TCS3200 OUT (frequency output)
+   - D5:  TCS3200 S2 (filter select bit 0)
+   - A0:  TCS3200 S3 (filter select bit 1, as digital output)
+   - D8:  HC-SR04 Ultrasonic (3-pin version, trigger/echo on same wire)
+   - D3:  Piezo buzzer
+   - D6:  LED 1
+   - D7:  LED 2
+
+   CRITICAL: Color sensor mounted at REAR of robot.
+             Robot extends 8" FORWARD from sensor position.
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
 #include <Servo.h>
-#include <Wire.h>
-#include <Adafruit_LSM6DSOX.h>
-#include <Adafruit_Sensor.h>
 
-// ==================== CONFIGURATION ====================
-#define DEBUG_MODE false          // Set true for Serial debugging
-#define TEST_SENSORS_ONLY false   // Set true to only test sensors
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DEBUG CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// ==================== PIN DEFINITIONS ====================
-// Drive Servos (Parallax continuous rotation)
-#define PIN_SERVO_LEFT 13
-#define PIN_SERVO_RIGHT 12
+#define DEBUG_MODE false   // Set true for Serial output during testing
 
-// Arm Servos (Standard hobby servos)
-#define PIN_ARM_LEFT 11
-#define PIN_ARM_RIGHT 10
+#if DEBUG_MODE
+  #define DEBUG_PRINT(x)    Serial.print(x)
+  #define DEBUG_PRINTLN(x)  Serial.println(x)
+  #define DEBUG_PRINTF(x,y) Serial.print(x); Serial.println(y)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTF(x,y)
+#endif
 
-// TCS3200 Color Sensor
-#define PIN_COLOR_OUT 4
-#define PIN_COLOR_S2 5
-#define PIN_COLOR_S3 A0  // Analog pin used as digital output
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CALIBRATED CONSTANTS - FROM CALIBRATION TOOL
+//  Run AutoWiper_Calibration.ino and copy measured values here
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// IR Sensors (Opponent detection ONLY, not boundaries)
-#define PIN_IR_LED_1 9
-#define PIN_IR_RX_1 8
-#define PIN_IR_LED_2 2
-#define PIN_IR_RX_2 1
+// Distance calibration (inches traveled in 1000ms)
+#define DISTANCE_PER_1000MS_FULL_SPEED  20.0   // Measure with calibration tool
+#define DISTANCE_PER_1000MS_HALF_SPEED  10.0   // Measure with calibration tool
 
-// Debug outputs
-#define PIN_BUZZER 3
-#define PIN_LED_1 6
-#define PIN_LED_2 7
+// Turn calibration (on-dime turns) - SEPARATE LEFT AND RIGHT
+#define TURN_LEFT_90_MS   650    // Time for 90° left turn at full speed
+#define TURN_RIGHT_90_MS  650    // Time for 90° right turn at full speed
 
-// ==================== SERVO POSITIONS ====================
-// Arm positions
-#define ARM_DEPLOYED 90      // Perpendicular to robot (12" width)
-#define ARM_LEFT_RETRACT 153 // 90 + 63 = CCW toward BACK (4.75" width)
-#define ARM_RIGHT_RETRACT 27 // 90 - 63 = CW toward BACK (4.75" width)
-
-// Drive servo speeds (microseconds)
-#define SERVO_STOP 1500
-#define SERVO_FULL_SPEED 200  // Offset from neutral for full speed
-
-// ==================== PHYSICAL CONSTANTS ====================
-#define ROBOT_LENGTH 8.0          // inches (sensor to front)
-#define ROBOT_WIDTH_RETRACTED 4.75 // inches (arms retracted)
-#define ROBOT_WIDTH_DEPLOYED 12.0  // inches (arms deployed)
-#define SWEEP_WIDTH 12.0           // inches per pass
-
-#define FIELD_WIDTH 48.0           // inches
-#define FIELD_LENGTH 48.0          // inches
-#define BOUNDARY_WIDTH 2.0         // inches (black border)
-
-// Safe operating boundaries for COLOR SENSOR position
-#define MIN_SENSOR_Y 4.0   // Sensor 2" into field from back boundary
-#define MAX_SENSOR_Y 40.0  // Robot front will be at 48" (40+8)
-
-// Movement calibration
-#define SPEED_INCHES_PER_SEC 9.0  // Typical BOE Shield-Bot speed
-#define TURN_90_DEGREES_MS 590    // Time for 90° rotation at full speed
-#define ODOMETRY_CORRECTION 0.95  // Correction factor for wheel slip
+// Traveling turn calibration
+#define TRAVELING_TURN_LEFT_SPEED   200   // Outer wheel (faster)
+#define TRAVELING_TURN_RIGHT_SPEED  80    // Inner wheel (slower)
+#define TRAVELING_TURN_90_DURATION  1200  // Duration for 90° traveling turn
 
 // Color sensor thresholds
-#define BLACK_THRESHOLD 600       // Duration above this = black surface
-#define COLOR_STABILIZE_MS 20     // Reduced stabilization delay (was 50ms)
-#define PULSEIN_TIMEOUT 30000     // Timeout for pulseIn (30ms)
+#define BLACK_THRESHOLD  600   // Both red AND blue > this = black boundary
 
-// ==================== GLOBAL OBJECTS ====================
+// Ultrasonic sensor
+#define OBSTACLE_DISTANCE_THRESHOLD  12.0  // inches - trigger avoidance
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PIN DEFINITIONS (VERIFIED - DO NOT CHANGE)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Drive Servos (Parallax continuous rotation)
+#define PIN_SERVO_LEFT    13
+#define PIN_SERVO_RIGHT   12
+
+// Arm Servos (Standard hobby servos)
+#define PIN_ARM_LEFT      11
+#define PIN_ARM_RIGHT     10
+
+// TCS3200 Color Sensor
+#define PIN_COLOR_OUT     4
+#define PIN_COLOR_S2      5
+#define PIN_COLOR_S3      A0   // Analog pin used as digital output
+
+// HC-SR04 Ultrasonic (3-pin version)
+#define PIN_ULTRASONIC    8
+
+// Debug outputs
+#define PIN_BUZZER        3
+#define PIN_LED_1         6
+#define PIN_LED_2         7
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SERVO CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#define SERVO_STOP        1500   // Neutral position (stopped)
+#define SPEED_OFFSET      200    // Offset from neutral for full speed
+
+// Arm positions (degrees)
+#define ARM_CENTER        90     // Perpendicular to robot (sweeping)
+#define ARM_LEFT_RETRACT  152    // 90 + 62 = CCW toward BACK
+#define ARM_RIGHT_RETRACT 28     // 90 - 62 = CW toward BACK
+#define ARM_LEFT_FORWARD  30     // 90 - 60 = toward FRONT (cube manipulation)
+#define ARM_RIGHT_FORWARD 150    // 90 + 60 = toward FRONT
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FIELD CONSTANTS (in UNITS = 1000ms at full speed)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Field dimensions converted to time units
+// 1 UNIT = distance traveled in 1000ms at full speed
+// Example: if DISTANCE_PER_1000MS_FULL_SPEED = 20", then 48" = 2.4 units = 2400ms
+
+#define FIELD_WIDTH_INCHES   48.0
+#define FIELD_LENGTH_INCHES  48.0
+#define ROBOT_LENGTH_INCHES  8.0
+
+// Calculate field dimensions in milliseconds (at full speed)
+#define MS_PER_INCH          (1000.0 / DISTANCE_PER_1000MS_FULL_SPEED)
+#define FIELD_WIDTH_MS       ((unsigned int)(FIELD_WIDTH_INCHES * MS_PER_INCH))
+#define FIELD_LENGTH_MS      ((unsigned int)(FIELD_LENGTH_INCHES * MS_PER_INCH))
+#define ROBOT_LENGTH_MS      ((unsigned int)(ROBOT_LENGTH_INCHES * MS_PER_INCH))
+
+// Midfield position (in ms from back boundary)
+#define MIDFIELD_MS          (FIELD_LENGTH_MS / 2)
+
+// Color sensor reading constants
+#define COLOR_STABILIZE_MS   15      // Stabilization delay after filter change
+#define PULSEIN_TIMEOUT      25000   // Timeout for pulseIn (25ms)
+
+// Safety margins (in ms)
+#define BOUNDARY_SAFETY_MS   200     // Stay this far from black boundary
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GLOBAL OBJECTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 Servo servoLeft, servoRight;
 Servo armLeft, armRight;
-Adafruit_LSM6DSOX lsm6ds;
 
-// ==================== GLOBAL STATE VARIABLES ====================
-// Position tracking - COLOR SENSOR POSITION (at REAR of robot)
-float colorSensor_X = 24.0;  // Start at center of field
-float colorSensor_Y = 2.0;   // Start at back boundary
-float heading = 0.0;         // Degrees (0 = forward into field)
+// ═══════════════════════════════════════════════════════════════════════════════
+//  POSITION TRACKING (in milliseconds of travel at full speed)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// Derived position (robot extends 8" forward from sensor)
-float getRobotFrontY() { return colorSensor_Y + ROBOT_LENGTH; }
-float getRobotCenterY() { return colorSensor_Y + ROBOT_LENGTH/2.0; }
+// Color sensor position (at REAR of robot) in ms units
+int colorSensor_X_ms = 0;    // 0 = left edge, FIELD_WIDTH_MS = right edge
+int colorSensor_Y_ms = 0;    // 0 = back boundary, FIELD_LENGTH_MS = front
+
+// Heading: 0° = facing forward (into opponent territory)
+//          90° = facing right, -90° = facing left, 180° = facing back
+int heading_deg = 0;
+
+// Robot front position = colorSensor_Y_ms + ROBOT_LENGTH_MS (when facing forward)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STATE TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // Field identification
-bool startedOnRedSide = false;
-bool currentlyOnOwnSide = true;
+enum FieldColor { COLOR_UNKNOWN, COLOR_RED, COLOR_BLUE };
+FieldColor ownSideColor = COLOR_UNKNOWN;
 
-// Strategy state
-enum StrategyPhase { INIT, OFFENSIVE, DEFENSIVE };
-StrategyPhase currentPhase = INIT;
+// Strategy phases
+enum Phase {
+  PHASE_INIT,           // 2-second delay, side detection
+  PHASE_NAVIGATE,       // Navigate to starting sweep position
+  PHASE_SWEEP,          // Execute offensive sweeps
+  PHASE_COMPLETE        // Match complete
+};
+Phase currentPhase = PHASE_INIT;
 
 // Sweep tracking
-int currentLane = 1;         // Lanes 1-4
+int currentLane = 1;           // Lanes 1-4 from right to left
+int completedSweeps = 0;
 bool sweepingForward = true;
-int completedOffensivePasses = 0;
 
 // Arm state
 bool armsDeployed = false;
 
 // Timing
-unsigned long startTime = 0;
-unsigned long lastGyroUpdate = 0;
+unsigned long matchStartTime = 0;
+#define MATCH_DURATION_MS  60000   // 60 seconds
 
-// Gyroscope integration
-float gyroHeading = 0.0;
+// Emergency flags
+bool emergencyStop = false;
 
-// Safety flags
-bool positionUncertain = false;
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FUNCTION PROTOTYPES
+// ═══════════════════════════════════════════════════════════════════════════════
 
-// Phase completion tracking (for adaptive transitions)
-bool phase1Complete = false;
+// Initialization
+void initializeSensors();
+void detectOwnSideColor();
 
-// Cached color sensor readings (for efficiency)
-unsigned long lastRedReading = 0;
-unsigned long lastBlueReading = 0;
-unsigned long lastColorReadTime = 0;
-#define COLOR_CACHE_VALID_MS 50  // Cache valid for 50ms
-
-// Watchdog for sweep loops (prevent getting stuck)
-unsigned long lastSweepProgress = 0;
-float lastWatchdogY = 0;
-#define WATCHDOG_TIMEOUT_MS 5000  // 5 seconds without progress = stuck
-#define WATCHDOG_MIN_PROGRESS 1.0 // Must move at least 1" to count as progress
-
-// ==================== FUNCTION PROTOTYPES ====================
-// Movement primitives
-void maneuver(int speedLeft, int speedRight, int msTime);
+// Movement primitives (with continuous boundary checking)
+void maneuver(int speedLeft, int speedRight, unsigned int duration_ms);
 void stopMotors();
-float estimateDistance(int duration_ms, int speed);
-void updatePositionFromMovement(int speedLeft, int speedRight, int duration_ms);
-
-// Navigation
-void moveForward(float distance_inches);
-void moveBackward(float distance_inches);
-void rotateLeft(float degrees);
-void rotateRight(float degrees);
-void rotateToHeading(float target_heading);
-void navigateToCoordinate(float target_X, float target_Y);
+bool moveForwardMs(unsigned int distance_ms);
+bool moveBackwardMs(unsigned int distance_ms);
+void turnOnDimeLeft();
+void turnOnDimeRight();
+void travelingTurnRight();
+void travelingTurnLeft();
 
 // Sensor reading
 unsigned long measureColorDuration(bool readRed);
-void readColorSensorCached(unsigned long &red, unsigned long &blue);
 bool detectBlackBoundary();
-bool detectBlackBoundaryFast();
-int checkFieldSide();
-bool scanForOpponent();
-void updateGyroscope();
+bool detectOwnSideColorNow();
+float measureUltrasonicDistance();
+bool detectObstacle();
 
 // Arm control
 void deployArms();
+void deployArmsForward();
 void retractArms();
-void ensureArmsRetracted();
 
 // Strategy execution
-void calibrateCoordinateSystem();
-void executePhase1_OffensiveSweep();
-void executePhase2_DefensiveClearing();
+void executePhase_Navigate();
+void executePhase_Sweep();
+void executeSingleSweepLane();
+void returnToOwnSide();
 
-// Error handling
+// Emergency handling
 void handleBoundaryEmergency();
-void evadeOpponent();
-void recoverPosition();
+void handleObstacleAvoidance();
 
 // Utilities
 void statusBeep(int frequency, int duration);
-float normalizeAngle(float angle);
-int irDetect(int irLedPin, int irReceiverPin, long frequency);
-bool checkWatchdog();
-void resetWatchdog();
+void blinkLED(int pin, int count);
+unsigned long getMatchElapsed();
+bool isMatchOver();
 
-// ==================== SETUP ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════════════════
+
 void setup() {
-  // 1. Serial initialization
   #if DEBUG_MODE
     Serial.begin(9600);
-    Serial.println("=== AUTOWIPER INITIALIZATION ===");
+    Serial.println(F("=== AUTOWIPER COMPETITION ==="));
   #endif
 
-  // 2. I2C for gyroscope
-  Wire.begin();
-
-  // 3. Attach servos
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Attach servos
+  // ─────────────────────────────────────────────────────────────────────────────
   servoLeft.attach(PIN_SERVO_LEFT);
   servoRight.attach(PIN_SERVO_RIGHT);
   armLeft.attach(PIN_ARM_LEFT);
   armRight.attach(PIN_ARM_RIGHT);
 
-  // Stop drive motors initially
+  // Stop drive motors
   stopMotors();
 
-  // 4. Color sensor pins
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Initialize pins
+  // ─────────────────────────────────────────────────────────────────────────────
   pinMode(PIN_COLOR_OUT, INPUT);
   pinMode(PIN_COLOR_S2, OUTPUT);
   pinMode(PIN_COLOR_S3, OUTPUT);
-
-  // 5. IR sensor pins (opponent detection only)
-  pinMode(PIN_IR_LED_1, OUTPUT);
-  pinMode(PIN_IR_RX_1, INPUT);
-  pinMode(PIN_IR_LED_2, OUTPUT);
-  pinMode(PIN_IR_RX_2, INPUT);
-
-  // 6. Debug outputs
+  pinMode(PIN_ULTRASONIC, OUTPUT);
+  digitalWrite(PIN_ULTRASONIC, LOW);
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_LED_1, OUTPUT);
   pinMode(PIN_LED_2, OUTPUT);
 
-  // 7. Initialize gyroscope
-  if (!lsm6ds.begin_I2C()) {
-    #if DEBUG_MODE
-      Serial.println("ERROR: Gyroscope init failed");
-    #endif
-    // Continue anyway - can fall back to dead reckoning
-  } else {
-    lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_250_DPS);
-    lsm6ds.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
-    #if DEBUG_MODE
-      Serial.println("Gyroscope initialized");
-    #endif
-  }
-
-  // 8. MANDATORY 2-SECOND DELAY (competition requirement)
-  statusBeep(3000, 500);
+  // ─────────────────────────────────────────────────────────────────────────────
+  // MANDATORY 2-SECOND START DELAY (Competition Requirement)
+  // ─────────────────────────────────────────────────────────────────────────────
   digitalWrite(PIN_LED_1, HIGH);
-  delay(2000);
+  statusBeep(2000, 500);
+
+  DEBUG_PRINTLN(F("Waiting 2 seconds..."));
+
+  delay(2000);  // REQUIRED BY COMPETITION RULES
+
   digitalWrite(PIN_LED_1, LOW);
+  statusBeep(3000, 200);
 
-  #if TEST_SENSORS_ONLY
-    // Test mode - just display sensor readings
-    Serial.println("=== SENSOR TEST MODE ===");
-    Serial.println("Color Sensor: Lower value = more reflection");
-    Serial.println("IR: 0=detected, 1=clear");
-    Serial.println();
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Record match start time
+  // ─────────────────────────────────────────────────────────────────────────────
+  matchStartTime = millis();
 
-    while(true) {
-      unsigned long red = measureColorDuration(true);
-      unsigned long blue = measureColorDuration(false);
-      bool black = detectBlackBoundary();
-      bool opponent = scanForOpponent();
-
-      // Determine surface color (INVERTED LOGIC for this sensor)
-      String surfaceColor = "UNKNOWN";
-      if(black) {
-        surfaceColor = "BLACK";
-      } else if(red > blue) {
-        surfaceColor = "RED (red=" + String(red) + " > blue=" + String(blue) + ")";
-      } else {
-        surfaceColor = "BLUE (blue=" + String(blue) + " > red=" + String(red) + ")";
-      }
-
-      Serial.print("Red: "); Serial.print(red);
-      Serial.print(" | Blue: "); Serial.print(blue);
-      Serial.print(" | Surface: "); Serial.print(surfaceColor);
-      Serial.print(" | IR: "); Serial.print(opponent ? "CLEAR" : "DETECTED");
-
-      // Try to read gyroscope
-      sensors_event_t accel, gyro, temp;
-      if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
-        Serial.print(" | GyroZ: "); Serial.print(gyro.gyro.z, 3);
-      } else {
-        Serial.print(" | Gyro: FAIL");
-      }
-
-      Serial.println();
-      delay(500);
-    }
-  #endif
-
-  // 9. Determine starting field color (RED or BLUE side)
-  delay(100);
-  unsigned long red = measureColorDuration(true);
-  unsigned long blue = measureColorDuration(false);
-
-  if(red < 600 && blue < 600) {
-    // On colored surface (not black boundary)
-    // INVERTED: Higher duration = that color surface (counterintuitive but matches hardware)
-    startedOnRedSide = (red > blue); // Red side if red shows higher duration
-  } else {
-    // Starting on black boundary - assume positioned correctly
-    startedOnRedSide = false; // Default assumption
-  }
-
-  #if DEBUG_MODE
-    Serial.print("Starting on ");
-    Serial.println(startedOnRedSide ? "RED side" : "BLUE side");
-  #endif
-
-  // 10. Initial boundary calibration
-  calibrateCoordinateSystem();
-
-  // 11. Zero gyroscope heading
-  gyroHeading = 0.0;
-  heading = 0.0;
-  lastGyroUpdate = millis();
-
-  // 12. Retract arms to starting width (4.75")
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Retract arms for initial maneuvering
+  // ─────────────────────────────────────────────────────────────────────────────
   retractArms();
 
-  // 13. Record start time
-  startTime = millis();
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Detect which side we're on (Phase 1)
+  // ─────────────────────────────────────────────────────────────────────────────
+  detectOwnSideColor();
 
-  // 14. Ready indication
-  statusBeep(2000, 200);
-  digitalWrite(PIN_LED_1, HIGH);
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Initialize position estimate
+  // Robot starts centered on back boundary, facing forward
+  // ─────────────────────────────────────────────────────────────────────────────
+  colorSensor_X_ms = FIELD_WIDTH_MS / 2;  // Center of field width
+  colorSensor_Y_ms = 0;                    // At back boundary
+  heading_deg = 0;                         // Facing forward
 
-  #if DEBUG_MODE
-    Serial.println("=== INITIALIZATION COMPLETE ===");
-    Serial.print("Position: X="); Serial.print(colorSensor_X);
-    Serial.print(" SensorY="); Serial.print(colorSensor_Y);
-    Serial.print(" FrontY="); Serial.println(getRobotFrontY());
-  #endif
+  DEBUG_PRINTLN(F("Initialization complete"));
+  DEBUG_PRINTF(F("Own side: "), ownSideColor == COLOR_RED ? "RED" : "BLUE");
+  DEBUG_PRINTF(F("Position X (ms): "), colorSensor_X_ms);
+  DEBUG_PRINTF(F("Position Y (ms): "), colorSensor_Y_ms);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Ready indication
+  // ─────────────────────────────────────────────────────────────────────────────
+  digitalWrite(PIN_LED_2, HIGH);
+  statusBeep(2500, 200);
+
+  // Move to navigation phase
+  currentPhase = PHASE_NAVIGATE;
 }
 
-// ==================== MAIN LOOP ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════════════════════════════
+
 void loop() {
-  // 1. Update elapsed time
-  unsigned long currentTime = millis();
-  unsigned long elapsed = (currentTime - startTime) / 1000;
-
-  // 2. Update sensors
-  updateGyroscope();
-  bool opponentDetected = scanForOpponent();
-  bool atBoundary = detectBlackBoundary();
-
-  // 3. Phase management (adaptive based on completion and time)
-  if(elapsed < 5) {
-    currentPhase = INIT;
-  } else if(elapsed < 35 && !phase1Complete) {
-    // Offensive phase: continue until all 4 passes done OR time limit
-    currentPhase = OFFENSIVE;
-  } else {
-    // Defensive phase: either Phase 1 complete or time expired
-    currentPhase = DEFENSIVE;
-  }
-
-  // 4. Time limit enforcement (60 seconds)
-  if(elapsed >= 60) {
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Check match time limit
+  // ─────────────────────────────────────────────────────────────────────────────
+  if (isMatchOver()) {
+    currentPhase = PHASE_COMPLETE;
     stopMotors();
+    retractArms();
+    digitalWrite(PIN_LED_1, HIGH);
     digitalWrite(PIN_LED_2, HIGH);
     statusBeep(4000, 1000);
 
-    #if DEBUG_MODE
-      Serial.println("=== MATCH COMPLETE ===");
-    #endif
+    DEBUG_PRINTLN(F("=== MATCH COMPLETE ==="));
 
-    while(true) {
-      delay(1000); // Match over - infinite loop
+    while (true) {
+      delay(1000);  // Match over - halt forever
     }
   }
 
-  // 5. Emergency boundary handling (HIGHEST PRIORITY)
-  if(atBoundary) {
-    bool expectedBoundary = false;
-
-    // Check if boundary detection is expected
-    if(colorSensor_Y < 6.0 && currentPhase == INIT) {
-      expectedBoundary = true; // Calibration phase
-    } else if(getRobotFrontY() > 45.0 && currentPhase == OFFENSIVE) {
-      expectedBoundary = true; // Deep offensive push
-    }
-
-    if(!expectedBoundary) {
-      #if DEBUG_MODE
-        Serial.println("EMERGENCY: Unexpected boundary!");
-      #endif
-      handleBoundaryEmergency();
-      return;
-    }
-  }
-
-  // 6. Opponent avoidance (HIGH PRIORITY)
-  if(opponentDetected && currentPhase != INIT) {
-    #if DEBUG_MODE
-      Serial.println("Opponent detected - evading");
-    #endif
-    evadeOpponent();
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Check for emergency conditions
+  // ─────────────────────────────────────────────────────────────────────────────
+  if (emergencyStop) {
+    stopMotors();
+    handleBoundaryEmergency();
+    emergencyStop = false;
     return;
   }
 
-  // 7. Execute strategy phase
-  switch(currentPhase) {
-    case INIT:
-      // Initialization should be complete, prepare for offensive
-      if(elapsed > 4) {
-        currentLane = 1;
-        completedOffensivePasses = 0;
-
-        #if DEBUG_MODE
-          Serial.println("Moving to OFFENSIVE phase");
-        #endif
-      }
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Execute current phase
+  // ─────────────────────────────────────────────────────────────────────────────
+  switch (currentPhase) {
+    case PHASE_INIT:
+      // Should not reach here - handled in setup()
+      currentPhase = PHASE_NAVIGATE;
       break;
 
-    case OFFENSIVE:
-      executePhase1_OffensiveSweep();
+    case PHASE_NAVIGATE:
+      executePhase_Navigate();
       break;
 
-    case DEFENSIVE:
-      executePhase2_DefensiveClearing();
+    case PHASE_SWEEP:
+      executePhase_Sweep();
+      break;
+
+    case PHASE_COMPLETE:
+      // Match over
       break;
   }
 
-  // 8. Position verification (every 3 seconds)
-  static unsigned long lastPositionCheck = 0;
-  if(currentTime - lastPositionCheck > 3000 && elapsed > 5) {
-    lastPositionCheck = currentTime;
-
-    int fieldSide = checkFieldSide();
-    if(fieldSide != 0) {
-      bool expectedOnOwnSide = (colorSensor_Y < 24.0);
-      bool actuallyOnOwnSide = (fieldSide == 1);
-
-      if(expectedOnOwnSide != actuallyOnOwnSide) {
-        positionUncertain = true;
-        #if DEBUG_MODE
-          Serial.println("WARNING: Position uncertain - initiating recovery");
-        #endif
-      }
-    }
-
-    // Execute recovery if position is uncertain
-    if(positionUncertain) {
-      recoverPosition();
-    }
-  }
-
-  // 9. Debug output
-  #if DEBUG_MODE
-    static unsigned long lastDebug = 0;
-    if(currentTime - lastDebug > 1000) {
-      Serial.print("T:"); Serial.print(elapsed);
-      Serial.print(" | Phase:"); Serial.print(currentPhase);
-      Serial.print(" | SensorY:"); Serial.print(colorSensor_Y, 1);
-      Serial.print(" | FrontY:"); Serial.print(getRobotFrontY(), 1);
-      Serial.print(" | X:"); Serial.print(colorSensor_X, 1);
-      Serial.print(" | H:"); Serial.print(heading, 1);
-
-      // Add gyroscope reading
-      sensors_event_t accel, gyro, temp;
-      if(lsm6ds.getEvent(&accel, &gyro, &temp)) {
-        Serial.print(" | GyroZ:"); Serial.print(gyro.gyro.z, 2);
-      }
-
-      // Add color sensor reading
-      unsigned long red = measureColorDuration(true);
-      unsigned long blue = measureColorDuration(false);
-      Serial.print(" | R:"); Serial.print(red);
-      Serial.print(" | B:"); Serial.print(blue);
-
-      Serial.println();
-      lastDebug = currentTime;
-    }
-  #endif
-
-  delay(20); // 20ms loop cycle
+  // Small delay to prevent tight loop
+  delay(10);
 }
 
-// ==================== MOVEMENT PRIMITIVES ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PHASE 1: SIDE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
 
-void maneuver(int speedLeft, int speedRight, int msTime) {
+void detectOwnSideColor() {
+  DEBUG_PRINTLN(F("Detecting field side color..."));
+
+  // Robot starts with sensor potentially over black boundary or colored field
+  // Move forward slightly until we're clearly on colored surface
+
+  unsigned long red, blue;
+
+  // Take initial reading
+  red = measureColorDuration(true);
+  blue = measureColorDuration(false);
+
+  DEBUG_PRINTF(F("Initial red: "), red);
+  DEBUG_PRINTF(F("Initial blue: "), blue);
+
+  // If on black boundary, move forward to colored surface
+  if (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD) {
+    DEBUG_PRINTLN(F("On black boundary, moving forward..."));
+
+    // Move forward slowly until color detected
+    for (int i = 0; i < 10; i++) {
+      maneuver(100, 100, 100);  // Slow forward pulse
+      delay(50);
+
+      red = measureColorDuration(true);
+      blue = measureColorDuration(false);
+
+      if (red < BLACK_THRESHOLD || blue < BLACK_THRESHOLD) {
+        DEBUG_PRINTLN(F("Color detected!"));
+        break;
+      }
+    }
+    stopMotors();
+  }
+
+  // Read color to determine our side
+  // Lower duration = more reflection = that color
+  red = measureColorDuration(true);
+  blue = measureColorDuration(false);
+
+  DEBUG_PRINTF(F("Final red: "), red);
+  DEBUG_PRINTF(F("Final blue: "), blue);
+
+  if (red < blue) {
+    ownSideColor = COLOR_RED;
+    DEBUG_PRINTLN(F("We are on RED side"));
+    blinkLED(PIN_LED_1, 3);  // LED pattern for red
+  } else {
+    ownSideColor = COLOR_BLUE;
+    DEBUG_PRINTLN(F("We are on BLUE side"));
+    blinkLED(PIN_LED_2, 3);  // LED pattern for blue
+  }
+
+  // Update position - sensor is now slightly into field
+  colorSensor_Y_ms = 200;  // Approximately 2" into field
+
+  statusBeep(2000, 200);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PHASE 2: NAVIGATE TO STARTING POSITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void executePhase_Navigate() {
+  static int navStep = 0;
+
+  DEBUG_PRINTF(F("Navigate step: "), navStep);
+
+  switch (navStep) {
+    case 0:
+      // ─────────────────────────────────────────────────────────────────────────
+      // Step 2A: Turn right to face right boundary
+      // ─────────────────────────────────────────────────────────────────────────
+      DEBUG_PRINTLN(F("Step 2A: Turn right"));
+      turnOnDimeRight();
+      heading_deg = 90;  // Now facing right
+      navStep = 1;
+      delay(200);
+      break;
+
+    case 1:
+      // ─────────────────────────────────────────────────────────────────────────
+      // Step 2B: Drive toward right boundary
+      // ─────────────────────────────────────────────────────────────────────────
+      {
+        DEBUG_PRINTLN(F("Step 2B: Drive right"));
+
+        // Calculate distance to drive (from center to near right edge)
+        // Current X: ~FIELD_WIDTH_MS/2, Target X: ~0.9 * FIELD_WIDTH_MS
+        unsigned int driveDistance = (FIELD_WIDTH_MS * 4) / 10;  // 40% of field width
+
+        if (moveForwardMs(driveDistance)) {
+          // Update position (moving right = increasing X when facing right)
+          colorSensor_X_ms += driveDistance;
+          navStep = 2;
+        } else {
+          // Boundary hit - adjust
+          DEBUG_PRINTLN(F("Boundary during right drive"));
+          handleBoundaryEmergency();
+        }
+        delay(200);
+      }
+      break;
+
+    case 2:
+      // ─────────────────────────────────────────────────────────────────────────
+      // Step 2C: Traveling turn left to face forward
+      // ─────────────────────────────────────────────────────────────────────────
+      DEBUG_PRINTLN(F("Step 2C: Traveling turn left"));
+      travelingTurnLeft();
+      heading_deg = 0;  // Now facing forward
+
+      // Traveling turn also moves us forward and slightly left
+      colorSensor_Y_ms += 400;   // Moved forward during turn
+      colorSensor_X_ms -= 200;   // Curved left slightly
+
+      navStep = 3;
+      delay(200);
+      break;
+
+    case 3:
+      // ─────────────────────────────────────────────────────────────────────────
+      // Navigation complete - move to sweep phase
+      // ─────────────────────────────────────────────────────────────────────────
+      DEBUG_PRINTLN(F("Navigation complete - starting sweeps"));
+      currentPhase = PHASE_SWEEP;
+      currentLane = 1;
+      completedSweeps = 0;
+
+      // Deploy arms for sweeping
+      deployArms();
+      delay(500);
+      break;
+
+    default:
+      navStep = 0;
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PHASE 3: OFFENSIVE SWEEP EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void executePhase_Sweep() {
+  DEBUG_PRINTF(F("Executing sweep lane: "), currentLane);
+
+  // Execute one sweep lane
+  executeSingleSweepLane();
+
+  // After sweep, check if we have time for more
+  if (!isMatchOver() && completedSweeps < 8) {  // Max 8 sweeps (4 lanes × 2)
+    // Return to own side and shift to next lane
+    returnToOwnSide();
+
+    // Shift to next lane
+    currentLane++;
+    if (currentLane > 4) {
+      currentLane = 1;  // Restart from right side
+    }
+
+    // Shift position for next lane (12" = about 600ms at 20"/s)
+    unsigned int laneShift_ms = (unsigned int)(12.0 * MS_PER_INCH);
+
+    // Turn left
+    turnOnDimeLeft();
+    heading_deg = -90;  // Facing left
+
+    // Move to next lane
+    if (moveForwardMs(laneShift_ms)) {
+      colorSensor_X_ms -= laneShift_ms;  // Moved left
+    }
+
+    // Turn back to face forward
+    turnOnDimeRight();
+    heading_deg = 0;
+
+    delay(200);
+  }
+}
+
+void executeSingleSweepLane() {
+  DEBUG_PRINTLN(F("Starting offensive sweep"));
+
+  // Deploy arms for maximum sweeping width
+  deployArms();
+  delay(300);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Forward sweep: Push cubes deep into opponent territory
+  // Target: 3/4 into opponent territory = 75% of field length
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  unsigned int targetY_ms = (FIELD_LENGTH_MS * 3) / 4;  // 75% depth
+  unsigned int moveChunk_ms = 200;  // Move in small chunks for safety
+
+  DEBUG_PRINTF(F("Sweeping to Y: "), targetY_ms);
+
+  while (colorSensor_Y_ms < targetY_ms) {
+    // Check match time
+    if (isMatchOver()) return;
+
+    // Check for obstacles
+    if (detectObstacle()) {
+      DEBUG_PRINTLN(F("Obstacle detected during sweep"));
+      handleObstacleAvoidance();
+      continue;
+    }
+
+    // Move forward in chunks
+    if (moveForwardMs(moveChunk_ms)) {
+      colorSensor_Y_ms += moveChunk_ms;
+    } else {
+      // Boundary or obstacle - stop sweep
+      DEBUG_PRINTLN(F("Stopping sweep - boundary detected"));
+      break;
+    }
+  }
+
+  stopMotors();
+  completedSweeps++;
+
+  DEBUG_PRINTF(F("Sweep complete, total sweeps: "), completedSweeps);
+
+  // At 3/4 depth, transition arms forward for cube manipulation
+  deployArmsForward();
+  delay(300);
+
+  // Push a bit more with arms forward
+  moveForwardMs(300);
+  colorSensor_Y_ms += 300;
+
+  stopMotors();
+}
+
+void returnToOwnSide() {
+  DEBUG_PRINTLN(F("Returning to own side"));
+
+  // Retract arms for navigation
+  retractArms();
+  delay(300);
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Reverse until we detect our own side color
+  // This ensures we're definitively back on our territory
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  unsigned int maxReverse_ms = MIDFIELD_MS + 400;  // Don't go past midfield + margin
+  unsigned int reversed_ms = 0;
+  unsigned int reverseChunk_ms = 200;
+
+  while (reversed_ms < maxReverse_ms) {
+    // Check match time
+    if (isMatchOver()) return;
+
+    // Check if we're back on our side
+    if (detectOwnSideColorNow()) {
+      DEBUG_PRINTLN(F("Own side detected!"));
+      break;
+    }
+
+    // Check for back boundary
+    if (detectBlackBoundary()) {
+      DEBUG_PRINTLN(F("Back boundary detected"));
+      moveForwardMs(200);  // Move away from boundary
+      colorSensor_Y_ms += 200;
+      break;
+    }
+
+    // Reverse
+    if (moveBackwardMs(reverseChunk_ms)) {
+      colorSensor_Y_ms -= reverseChunk_ms;
+      reversed_ms += reverseChunk_ms;
+    } else {
+      // Boundary hit
+      break;
+    }
+  }
+
+  stopMotors();
+
+  // Reset Y position estimate based on color detection
+  if (detectOwnSideColorNow()) {
+    colorSensor_Y_ms = MIDFIELD_MS - 400;  // Just before midfield on our side
+  }
+
+  DEBUG_PRINTF(F("Return complete, Y position: "), colorSensor_Y_ms);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MOVEMENT PRIMITIVES (with continuous boundary checking)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void maneuver(int speedLeft, int speedRight, unsigned int duration_ms) {
   // Speed range: -200 to +200
-  // Positive = forward, Negative = backward, 0 = stop
+  // Positive = forward, Negative = backward
 
   servoLeft.writeMicroseconds(SERVO_STOP + speedLeft);
   servoRight.writeMicroseconds(SERVO_STOP - speedRight);
 
-  if(msTime > 0) {
-    delay(msTime);
-  } else if(msTime == -1) {
-    // Disable servos
-    servoLeft.detach();
-    servoRight.detach();
+  if (duration_ms > 0) {
+    delay(duration_ms);
   }
 }
 
@@ -491,846 +701,337 @@ void stopMotors() {
   delay(50);
 }
 
-float estimateDistance(int duration_ms, int speed) {
-  // Estimate distance traveled based on duration and speed
-  // speed is in range -200 to +200
-  float speedFraction = abs(speed) / 200.0;
-  float distance = (SPEED_INCHES_PER_SEC * speedFraction * duration_ms / 1000.0);
-  return distance * ODOMETRY_CORRECTION; // Apply correction for wheel slip
-}
+// Move forward with CONTINUOUS boundary monitoring
+// Returns true if completed successfully, false if boundary detected
+bool moveForwardMs(unsigned int distance_ms) {
+  unsigned int chunk_ms = 50;  // Check boundary every 50ms
+  unsigned int moved_ms = 0;
 
-void updatePositionFromMovement(int speedLeft, int speedRight, int duration_ms) {
-  // Update position based on movement
-  float distance = estimateDistance(duration_ms, (speedLeft + speedRight) / 2);
-
-  // Convert heading to radians
-  float radians = heading * PI / 180.0;
-
-  // Update sensor position (at rear of robot)
-  colorSensor_X += distance * sin(radians);
-  colorSensor_Y += distance * cos(radians);
-
-  // Clamp to field boundaries
-  if(colorSensor_X < 0) colorSensor_X = 0;
-  if(colorSensor_X > FIELD_WIDTH) colorSensor_X = FIELD_WIDTH;
-  if(colorSensor_Y < 0) colorSensor_Y = 0;
-  if(colorSensor_Y > FIELD_LENGTH) colorSensor_Y = FIELD_LENGTH;
-}
-
-// ==================== NAVIGATION ====================
-
-void moveForward(float distance_inches) {
-  int duration = (int)(distance_inches / SPEED_INCHES_PER_SEC * 1000.0);
-
-  // Move with gyroscope correction
-  unsigned long startMove = millis();
-  float targetHeading = heading;
-
-  while(millis() - startMove < duration) {
-    updateGyroscope();
-
-    // Calculate heading error
-    float headingError = normalizeAngle(heading - targetHeading);
-
-    // Apply correction
-    int correction = (int)(headingError * 2.5);
-    correction = constrain(correction, -50, 50);
-
-    maneuver(SERVO_FULL_SPEED - correction, SERVO_FULL_SPEED + correction, 50);
-    updatePositionFromMovement(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 50);
-
-    // Safety check for boundary
-    if(detectBlackBoundary() && getRobotFrontY() > 45.0) {
-      #if DEBUG_MODE
-        Serial.println("Boundary detected during forward movement");
-      #endif
-      break;
-    }
-  }
-
-  stopMotors();
-}
-
-void moveBackward(float distance_inches) {
-  int duration = (int)(distance_inches / SPEED_INCHES_PER_SEC * 1000.0);
-
-  maneuver(-SERVO_FULL_SPEED, -SERVO_FULL_SPEED, duration);
-  updatePositionFromMovement(-SERVO_FULL_SPEED, -SERVO_FULL_SPEED, duration);
-
-  stopMotors();
-}
-
-void rotateLeft(float degrees) {
-  int duration = (int)(degrees / 90.0 * TURN_90_DEGREES_MS);
-
-  maneuver(-SERVO_FULL_SPEED, SERVO_FULL_SPEED, duration);
-
-  heading -= degrees;
-  heading = normalizeAngle(heading);
-
-  stopMotors();
-}
-
-void rotateRight(float degrees) {
-  int duration = (int)(degrees / 90.0 * TURN_90_DEGREES_MS);
-
-  maneuver(SERVO_FULL_SPEED, -SERVO_FULL_SPEED, duration);
-
-  heading += degrees;
-  heading = normalizeAngle(heading);
-
-  stopMotors();
-}
-
-void rotateToHeading(float target_heading) {
-  target_heading = normalizeAngle(target_heading);
-  float error = normalizeAngle(target_heading - heading);
-
-  if(abs(error) < 3.0) return; // Within tolerance
-
-  if(error > 0) {
-    rotateRight(abs(error));
-  } else {
-    rotateLeft(abs(error));
-  }
-}
-
-void navigateToCoordinate(float target_X, float target_Y) {
-  // Ensure arms are retracted for navigation
-  ensureArmsRetracted();
-
-  // Calculate required movement
-  float deltaX = target_X - colorSensor_X;
-  float deltaY = target_Y - colorSensor_Y;
-
-  // Calculate required heading and distance
-  float targetHeading = atan2(deltaX, deltaY) * 180.0 / PI;
-  float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
-
-  // Skip navigation if already at target (within tolerance)
-  if(distance < 2.0) {
-    return;
-  }
-
-  #if DEBUG_MODE
-    Serial.print("Navigate: Current("); Serial.print(colorSensor_X, 1);
-    Serial.print(","); Serial.print(colorSensor_Y, 1);
-    Serial.print(") -> Target("); Serial.print(target_X, 1);
-    Serial.print(","); Serial.print(target_Y, 1);
-    Serial.print(") Dist:"); Serial.print(distance, 1);
-    Serial.print(" Head:"); Serial.println(targetHeading, 1);
-  #endif
-
-  // Rotate to target heading
-  rotateToHeading(targetHeading);
-  delay(100);
-
-  // Move forward with opponent detection
-  int duration = (int)(distance / SPEED_INCHES_PER_SEC * 1000.0);
-  unsigned long startMove = millis();
-
-  while(millis() - startMove < duration) {
-    // Check for opponent during navigation
-    if(scanForOpponent()) {
-      #if DEBUG_MODE
-        Serial.println("Opponent detected during navigation!");
-      #endif
+  while (moved_ms < distance_ms) {
+    // CRITICAL: Check for black boundary BEFORE moving
+    if (detectBlackBoundary()) {
       stopMotors();
-      evadeOpponent();
-      return; // Re-plan navigation after evasion
+      DEBUG_PRINTLN(F("BOUNDARY DETECTED - stopping"));
+      statusBeep(500, 200);
+      return false;
     }
 
-    updateGyroscope();
+    // Calculate this chunk size
+    unsigned int thisChunk = min(chunk_ms, distance_ms - moved_ms);
 
-    // Calculate heading error
-    float headingError = normalizeAngle(heading - targetHeading);
+    // Execute movement
+    maneuver(SPEED_OFFSET, SPEED_OFFSET, thisChunk);
 
-    // Apply correction
-    int correction = (int)(headingError * 2.5);
-    correction = constrain(correction, -50, 50);
-
-    maneuver(SERVO_FULL_SPEED - correction, SERVO_FULL_SPEED + correction, 50);
-    updatePositionFromMovement(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 50);
-
-    // Safety check for boundary
-    if(detectBlackBoundaryFast()) {
-      #if DEBUG_MODE
-        Serial.println("Boundary detected during navigation!");
-      #endif
-      break;
-    }
+    moved_ms += thisChunk;
   }
+
+  stopMotors();
+  return true;
+}
+
+// Move backward with CONTINUOUS boundary monitoring
+bool moveBackwardMs(unsigned int distance_ms) {
+  unsigned int chunk_ms = 50;
+  unsigned int moved_ms = 0;
+
+  while (moved_ms < distance_ms) {
+    // Check for black boundary
+    if (detectBlackBoundary()) {
+      stopMotors();
+      DEBUG_PRINTLN(F("BOUNDARY DETECTED - stopping"));
+      statusBeep(500, 200);
+      return false;
+    }
+
+    unsigned int thisChunk = min(chunk_ms, distance_ms - moved_ms);
+
+    // Execute backward movement
+    maneuver(-SPEED_OFFSET, -SPEED_OFFSET, thisChunk);
+
+    moved_ms += thisChunk;
+  }
+
+  stopMotors();
+  return true;
+}
+
+void turnOnDimeLeft() {
+  DEBUG_PRINTLN(F("Turn left 90 degrees"));
+
+  // Left turn: left wheel backward, right wheel forward
+  maneuver(-SPEED_OFFSET, SPEED_OFFSET, TURN_LEFT_90_MS);
 
   stopMotors();
   delay(100);
 }
 
-// ==================== SENSOR READING ====================
+void turnOnDimeRight() {
+  DEBUG_PRINTLN(F("Turn right 90 degrees"));
+
+  // Right turn: left wheel forward, right wheel backward
+  maneuver(SPEED_OFFSET, -SPEED_OFFSET, TURN_RIGHT_90_MS);
+
+  stopMotors();
+  delay(100);
+}
+
+void travelingTurnRight() {
+  DEBUG_PRINTLN(F("Traveling turn right"));
+
+  // Curved right turn: left wheel faster than right
+  maneuver(TRAVELING_TURN_LEFT_SPEED, TRAVELING_TURN_RIGHT_SPEED,
+           TRAVELING_TURN_90_DURATION);
+
+  stopMotors();
+  delay(100);
+}
+
+void travelingTurnLeft() {
+  DEBUG_PRINTLN(F("Traveling turn left"));
+
+  // Curved left turn: right wheel faster than left
+  maneuver(TRAVELING_TURN_RIGHT_SPEED, TRAVELING_TURN_LEFT_SPEED,
+           TRAVELING_TURN_90_DURATION);
+
+  stopMotors();
+  delay(100);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SENSOR READING FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 unsigned long measureColorDuration(bool readRed) {
-  if(readRed) {
-    // Select RED photodiodes
+  // Set filter selection
+  if (readRed) {
+    // Select RED photodiodes (S2=LOW, S3=LOW)
     digitalWrite(PIN_COLOR_S2, LOW);
     digitalWrite(PIN_COLOR_S3, LOW);
   } else {
-    // Select BLUE photodiodes
+    // Select BLUE photodiodes (S2=LOW, S3=HIGH)
     digitalWrite(PIN_COLOR_S2, LOW);
     digitalWrite(PIN_COLOR_S3, HIGH);
   }
 
-  delay(COLOR_STABILIZE_MS); // Reduced stabilization delay
+  delayMicroseconds(COLOR_STABILIZE_MS * 1000);
 
   // Read frequency as pulse duration
   unsigned long duration = pulseIn(PIN_COLOR_OUT, LOW, PULSEIN_TIMEOUT);
 
-  // CRITICAL FIX: pulseIn returns 0 on timeout, NOT a high value
-  // Timeout indicates no pulse received = very dark surface (black)
-  // Return a high value to indicate black detection
-  if(duration == 0) {
-    duration = BLACK_THRESHOLD + 200; // Treat timeout as black
+  // pulseIn returns 0 on timeout - treat as very dark (black)
+  if (duration == 0) {
+    duration = BLACK_THRESHOLD + 200;  // Indicate timeout = black
   }
 
   return duration;
 }
 
-// Optimized color reading with caching
-void readColorSensorCached(unsigned long &red, unsigned long &blue) {
-  unsigned long now = millis();
-
-  // Return cached values if still valid
-  if(now - lastColorReadTime < COLOR_CACHE_VALID_MS && lastColorReadTime > 0) {
-    red = lastRedReading;
-    blue = lastBlueReading;
-    return;
-  }
-
-  // Read new values
-  red = measureColorDuration(true);
-  blue = measureColorDuration(false);
-
-  // Cache the readings
-  lastRedReading = red;
-  lastBlueReading = blue;
-  lastColorReadTime = now;
-}
-
 bool detectBlackBoundary() {
-  unsigned long red, blue;
-  readColorSensorCached(red, blue);
+  unsigned long red = measureColorDuration(true);
+  unsigned long blue = measureColorDuration(false);
 
-  // Black border: BOTH colors show very low intensity (high duration)
-  bool isBlack = (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD);
-
-  return isBlack;
+  // Black boundary: BOTH colors show high duration (low reflection)
+  return (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD);
 }
 
-// Fast boundary check without reading sensor (uses cached values)
-bool detectBlackBoundaryFast() {
-  // Only use cached values if recent
-  if(millis() - lastColorReadTime < COLOR_CACHE_VALID_MS && lastColorReadTime > 0) {
-    return (lastRedReading > BLACK_THRESHOLD && lastBlueReading > BLACK_THRESHOLD);
-  }
-  // Fall back to full read
-  return detectBlackBoundary();
-}
-
-int checkFieldSide() {
-  // Returns: 1 = own side, -1 = opponent side, 0 = boundary/uncertain
-
-  unsigned long red, blue;
-  readColorSensorCached(red, blue);
-
-  // Check for black boundary first (uses same cached values)
-  if(red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD) {
-    return 0; // At boundary, can't determine side
-  }
+bool detectOwnSideColorNow() {
+  // Check if currently on our own side color
 
   unsigned long red = measureColorDuration(true);
   unsigned long blue = measureColorDuration(false);
 
-  // INVERTED: Higher duration = that color surface (matches hardware behavior)
-  bool readingRed = (red > blue);
+  // Check for black first
+  if (red > BLACK_THRESHOLD && blue > BLACK_THRESHOLD) {
+    return false;  // On boundary, not on colored surface
+  }
 
-  // Compare with starting field color
-  if(readingRed == startedOnRedSide) {
-    return 1; // On own side
+  // Determine current surface color
+  FieldColor currentColor;
+  if (red < blue) {
+    currentColor = COLOR_RED;
   } else {
-    return -1; // On opponent's side
-  }
-}
-
-bool scanForOpponent() {
-  // IR sensors detect opponent robot ONLY (not boundaries)
-
-  int frontLeft = irDetect(PIN_IR_LED_1, PIN_IR_RX_1, 38000);
-  int frontRight = irDetect(PIN_IR_LED_2, PIN_IR_RX_2, 38000);
-
-  // IR returns 0 when object detected
-  return (frontLeft == 0 || frontRight == 0);
-}
-
-int irDetect(int irLedPin, int irReceiverPin, long frequency) {
-  tone(irLedPin, frequency, 8); // Emit IR for 8ms
-  delay(1);
-  int ir = digitalRead(irReceiverPin);
-  delay(1);
-  return ir; // 0 = detection, 1 = no detection
-}
-
-void updateGyroscope() {
-  sensors_event_t accel, gyro, temp;
-
-  if(!lsm6ds.getEvent(&accel, &gyro, &temp)) {
-    return; // Failed to read
+    currentColor = COLOR_BLUE;
   }
 
-  unsigned long currentTime = millis();
-  float dt = (currentTime - lastGyroUpdate) / 1000.0; // Convert to seconds
-
-  if(dt > 0.001 && dt < 1.0) { // Sanity check
-    float gyroZ = gyro.gyro.z; // Z-axis rotation in rad/s
-
-    // Integrate to get heading
-    heading += gyroZ * dt * (180.0 / PI); // Convert to degrees
-    heading = normalizeAngle(heading);
-  }
-
-  lastGyroUpdate = currentTime;
+  return (currentColor == ownSideColor);
 }
 
-// ==================== ARM CONTROL ====================
+float measureUltrasonicDistance() {
+  // HC-SR04 3-pin configuration: trigger and echo on same pin
+
+  // Send trigger pulse
+  pinMode(PIN_ULTRASONIC, OUTPUT);
+  digitalWrite(PIN_ULTRASONIC, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_ULTRASONIC, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_ULTRASONIC, LOW);
+
+  // Read echo
+  pinMode(PIN_ULTRASONIC, INPUT);
+  unsigned long duration = pulseIn(PIN_ULTRASONIC, HIGH, 30000);  // 30ms timeout
+
+  // Calculate distance in inches
+  // Speed of sound = 343 m/s = 0.0135 in/µs
+  // Distance = (duration * 0.0135) / 2 (round trip)
+  float distance = duration * 0.00675;
+
+  return distance;
+}
+
+bool detectObstacle() {
+  float distance = measureUltrasonicDistance();
+
+  // Check if obstacle within threshold
+  if (distance > 0 && distance < OBSTACLE_DISTANCE_THRESHOLD) {
+    DEBUG_PRINTF(F("Obstacle at: "), distance);
+    return true;
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ARM CONTROL
+// ═══════════════════════════════════════════════════════════════════════════════
 
 void deployArms() {
-  if(armsDeployed) return; // Already deployed
+  if (armsDeployed) return;
 
-  armLeft.write(ARM_DEPLOYED);
-  armRight.write(ARM_DEPLOYED);
-  delay(500); // Allow deployment
+  DEBUG_PRINTLN(F("Deploying arms (perpendicular)"));
+
+  armLeft.write(ARM_CENTER);   // 90° perpendicular
+  armRight.write(ARM_CENTER);
+  delay(400);
 
   armsDeployed = true;
+}
 
-  #if DEBUG_MODE
-    Serial.println("Arms DEPLOYED - 12\" width");
-  #endif
+void deployArmsForward() {
+  DEBUG_PRINTLN(F("Deploying arms (forward)"));
+
+  armLeft.write(ARM_LEFT_FORWARD);    // 30° (forward)
+  armRight.write(ARM_RIGHT_FORWARD);  // 150° (forward)
+  delay(400);
+
+  armsDeployed = true;
 }
 
 void retractArms() {
-  if(!armsDeployed && armLeft.read() == ARM_LEFT_RETRACT) {
-    return; // Already retracted
-  }
+  DEBUG_PRINTLN(F("Retracting arms"));
 
-  armLeft.write(ARM_LEFT_RETRACT);   // 153° (CCW toward back)
-  armRight.write(ARM_RIGHT_RETRACT); // 27° (CW toward back)
-  delay(500); // Allow retraction
+  armLeft.write(ARM_LEFT_RETRACT);    // 152° (back)
+  armRight.write(ARM_RIGHT_RETRACT);  // 28° (back)
+  delay(400);
 
   armsDeployed = false;
-
-  #if DEBUG_MODE
-    Serial.println("Arms RETRACTED - 4.75\" width");
-  #endif
 }
 
-void ensureArmsRetracted() {
-  if(armsDeployed) {
-    retractArms();
-  }
-}
-
-// ==================== STRATEGY EXECUTION ====================
-
-void calibrateCoordinateSystem() {
-  #if DEBUG_MODE
-    Serial.println("Calibrating coordinate system...");
-  #endif
-
-  // Robot should be at back boundary
-  // Back up slowly until black is definitively detected
-
-  bool blackDetected = false;
-  int attempts = 0;
-
-  while(!blackDetected && attempts < 10) {
-    if(detectBlackBoundary()) {
-      blackDetected = true;
-      break;
-    }
-
-    // Back up slightly
-    maneuver(-100, -100, 100); // Slow 100ms reverse
-    colorSensor_Y -= estimateDistance(100, 100);
-    attempts++;
-    delay(50);
-  }
-
-  if(blackDetected) {
-    // Lock coordinate system
-    colorSensor_Y = 2.0; // Sensor at boundary edge
-
-    #if DEBUG_MODE
-      Serial.print("Calibration complete. SensorY=");
-      Serial.print(colorSensor_Y);
-      Serial.print(" FrontY=");
-      Serial.println(getRobotFrontY());
-    #endif
-  } else {
-    // Calibration failed - use starting assumption
-    colorSensor_Y = 2.0;
-
-    #if DEBUG_MODE
-      Serial.println("WARNING: Calibration failed, using default");
-    #endif
-  }
-
-  // Move slightly forward to clear boundary
-  maneuver(150, 150, 300);
-  colorSensor_Y += estimateDistance(300, 150);
-  stopMotors();
-}
-
-void executePhase1_OffensiveSweep() {
-  // Execute 4 sweeping passes across opponent's territory
-  // Lanes at X = 6", 18", 30", 42"
-
-  if(completedOffensivePasses >= 4) {
-    phase1Complete = true; // Signal transition to Phase 2
-    #if DEBUG_MODE
-      Serial.println("Phase 1 COMPLETE - transitioning to defensive");
-    #endif
-    return; // All offensive passes complete
-  }
-
-  static bool inPosition = false;
-  static bool sweepComplete = false;
-
-  if(!inPosition) {
-    // Navigate to lane start position
-    float laneX = 6.0 + (completedOffensivePasses * 12.0); // 6, 18, 30, 42
-    float startY = 16.0; // Start position (clear of back boundary)
-
-    #if DEBUG_MODE
-      Serial.print("Phase 1: Moving to lane ");
-      Serial.print(completedOffensivePasses + 1);
-      Serial.print(" at X="); Serial.println(laneX);
-    #endif
-
-    navigateToCoordinate(laneX, startY);
-    rotateToHeading(0.0); // Face forward
-
-    deployArms(); // Deploy for sweeping
-
-    inPosition = true;
-    sweepComplete = false;
-    delay(300);
-  }
-
-  if(inPosition && !sweepComplete) {
-    // Execute forward sweep to opponent's territory
-    // Target: sensor at Y=38" (front at Y=46", safe from boundary)
-
-    #if DEBUG_MODE
-      Serial.println("Executing offensive sweep...");
-    #endif
-
-    // Reset watchdog for this sweep
-    resetWatchdog();
-
-    while(colorSensor_Y < 38.0) {
-      // Check for opponent
-      if(scanForOpponent()) {
-        statusBeep(4000, 100);
-        evadeOpponent();
-        break;
-      }
-
-      // Check for boundary (safety)
-      if(detectBlackBoundaryFast()) {
-        #if DEBUG_MODE
-          Serial.println("Boundary detected - stopping sweep");
-        #endif
-        break;
-      }
-
-      // Check watchdog (stuck detection)
-      if(checkWatchdog()) {
-        #if DEBUG_MODE
-          Serial.println("Watchdog triggered - aborting sweep");
-        #endif
-        statusBeep(1000, 200);
-        // Back up and try to recover
-        moveBackward(4.0);
-        break;
-      }
-
-      // Move forward with correction
-      updateGyroscope();
-      float headingError = normalizeAngle(heading - 0.0);
-      int correction = (int)(headingError * 2.5);
-      correction = constrain(correction, -50, 50);
-
-      maneuver(SERVO_FULL_SPEED - correction, SERVO_FULL_SPEED + correction, 100);
-      updatePositionFromMovement(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 100);
-    }
-
-    sweepComplete = true;
-    stopMotors();
-
-    #if DEBUG_MODE
-      Serial.println("Sweep complete - returning to midfield");
-    #endif
-
-    // Retract arms and return to midfield
-    retractArms();
-    moveBackward(15.0); // Back to around Y=24" (midfield)
-
-    // Complete this pass
-    completedOffensivePasses++;
-    inPosition = false;
-
-    #if DEBUG_MODE
-      Serial.print("Completed offensive pass ");
-      Serial.print(completedOffensivePasses);
-      Serial.println(" of 4");
-    #endif
-
-    delay(200);
-  }
-}
-
-void executePhase2_DefensiveClearing() {
-  // Aggressive defensive sweeping: push cubes from own side TOWARD opponent
-  // Strategy: Sweep forward from near back boundary past midfield, then return
-  // This pushes any cubes on our side toward opponent territory
-
-  static bool isInitialized = false;
-  static bool returningSweep = false;
-
-  // Defensive sweep boundaries (more aggressive than before)
-  const float DEFENSE_START_Y = 8.0;   // Start near back boundary
-  const float DEFENSE_END_Y = 28.0;    // Push past midfield (24") into opponent territory
-
-  if(!isInitialized) {
-    // Initialize defensive phase
-    currentLane = 1;
-    returningSweep = false;
-
-    #if DEBUG_MODE
-      Serial.println("Phase 2: AGGRESSIVE defensive clearing initiated");
-    #endif
-
-    // Navigate to starting position (lane 1, near back boundary)
-    navigateToCoordinate(6.0, DEFENSE_START_Y);
-    rotateToHeading(0.0);
-    deployArms();
-
-    isInitialized = true;
-  }
-
-  if(!returningSweep) {
-    // FORWARD SWEEP: Push cubes from own side toward opponent (Y increasing)
-    // This is the aggressive part - moving forward pushes cubes
-
-    // Reset watchdog for this sweep
-    resetWatchdog();
-
-    while(colorSensor_Y < DEFENSE_END_Y) {
-      // Check for opponent
-      if(scanForOpponent()) {
-        statusBeep(4000, 100);
-        evadeOpponent();
-        return; // Re-enter function after evasion
-      }
-
-      // Check for boundary (safety)
-      if(detectBlackBoundaryFast()) {
-        #if DEBUG_MODE
-          Serial.println("Boundary detected during defensive sweep");
-        #endif
-        break;
-      }
-
-      // Check watchdog (stuck detection)
-      if(checkWatchdog()) {
-        #if DEBUG_MODE
-          Serial.println("Watchdog triggered in defensive sweep");
-        #endif
-        statusBeep(1000, 200);
-        moveBackward(4.0);
-        break;
-      }
-
-      // Move forward with gyroscope correction
-      updateGyroscope();
-      float headingError = normalizeAngle(heading - 0.0);
-      int correction = (int)(headingError * 2.5);
-      correction = constrain(correction, -50, 50);
-
-      maneuver(SERVO_FULL_SPEED - correction, SERVO_FULL_SPEED + correction, 100);
-      updatePositionFromMovement(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 100);
-    }
-
-    stopMotors();
-
-    #if DEBUG_MODE
-      Serial.print("Defensive forward sweep complete at Y=");
-      Serial.println(colorSensor_Y);
-    #endif
-
-    // Prepare for return sweep (retract arms, move to next lane)
-    retractArms();
-
-    // Shift to next lane
-    currentLane++;
-    if(currentLane > 4) currentLane = 1;
-
-    float nextLaneX = 6.0 + ((currentLane - 1) * 12.0);
-
-    // Navigate back toward own territory without sweeping
-    // (don't deploy arms during return - we don't want to pull cubes back!)
-    navigateToCoordinate(nextLaneX, DEFENSE_START_Y + 2.0);
-    rotateToHeading(0.0); // Face forward again
-
-    // Deploy arms for next sweep
-    deployArms();
-
-    // Note: we DON'T set returningSweep=true because we want to
-    // always sweep FORWARD (pushing cubes away from our side)
-    // The "return" is just repositioning without active sweeping
-
-  }
-  // If somehow returningSweep got set, reset it
-  returningSweep = false;
-}
-
-// ==================== ERROR HANDLING ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+//  EMERGENCY HANDLING
+// ═══════════════════════════════════════════════════════════════════════════════
 
 void handleBoundaryEmergency() {
-  stopMotors();
-  statusBeep(500, 300); // Low warning tone
-
-  // Retract arms for safety during emergency maneuver
-  ensureArmsRetracted();
-
-  #if DEBUG_MODE
-    Serial.print("BOUNDARY EMERGENCY at SensorY=");
-    Serial.print(colorSensor_Y);
-    Serial.print(" FrontY=");
-    Serial.println(getRobotFrontY());
-  #endif
-
-  // Determine boundary type based on position estimate
-  if(getRobotFrontY() > 42.0) {
-    // Near front boundary (opponent's back edge)
-    #if DEBUG_MODE
-      Serial.println("Emergency: FRONT boundary - reversing");
-    #endif
-
-    // Aggressive reverse
-    maneuver(-SERVO_FULL_SPEED, -SERVO_FULL_SPEED, 800);
-    colorSensor_Y -= estimateDistance(800, SERVO_FULL_SPEED);
-
-    // Reset to safe position estimate
-    colorSensor_Y = 36.0; // Conservative estimate after retreat
-
-  } else if(colorSensor_Y < 8.0) {
-    // Near back boundary (own back edge)
-    #if DEBUG_MODE
-      Serial.println("Emergency: BACK boundary - advancing");
-    #endif
-
-    // Move forward
-    maneuver(SERVO_FULL_SPEED, SERVO_FULL_SPEED, 600);
-    colorSensor_Y += estimateDistance(600, SERVO_FULL_SPEED);
-
-    // Reset to safe position estimate
-    colorSensor_Y = 10.0;
-
-  } else if(colorSensor_X < 8.0 || colorSensor_X > 40.0) {
-    // Near side boundary (left or right edge)
-    #if DEBUG_MODE
-      Serial.println("Emergency: SIDE boundary");
-    #endif
-
-    // Turn away from edge and move toward center
-    if(colorSensor_X < 24.0) {
-      // Near left edge - turn right
-      rotateRight(45.0);
-      moveForward(6.0);
-      rotateLeft(45.0);
-      colorSensor_X += 4.0; // Estimate position shift
-    } else {
-      // Near right edge - turn left
-      rotateLeft(45.0);
-      moveForward(6.0);
-      rotateRight(45.0);
-      colorSensor_X -= 4.0;
-    }
-
-  } else {
-    // Unexpected boundary in middle of field
-    // This is unusual - might be sensor error or major drift
-    #if DEBUG_MODE
-      Serial.println("Emergency: UNEXPECTED boundary - conservative retreat");
-    #endif
-
-    // Back away conservatively
-    moveBackward(6.0);
-
-    // Mark position as uncertain for recovery
-    positionUncertain = true;
-  }
+  DEBUG_PRINTLN(F("BOUNDARY EMERGENCY"));
 
   stopMotors();
-  delay(200);
+  statusBeep(500, 300);
 
-  // Invalidate color sensor cache to get fresh reading
-  lastColorReadTime = 0;
-}
-
-void evadeOpponent() {
-  stopMotors();
-  statusBeep(4000, 100); // High alert tone
-
-  #if DEBUG_MODE
-    Serial.println("Evading opponent...");
-  #endif
-
-  // Retract arms for maneuvering
+  // Retract arms for safety
   retractArms();
 
-  // Determine evasion direction
-  float distToLeftEdge = colorSensor_X - 6.0;
-  float distToRightEdge = 42.0 - colorSensor_X;
+  // Determine which boundary based on position estimate
+  if (colorSensor_Y_ms > MIDFIELD_MS) {
+    // Likely at front boundary (opponent's back) - reverse
+    DEBUG_PRINTLN(F("Front boundary - reversing"));
 
-  if(distToLeftEdge > distToRightEdge) {
-    // Evade LEFT
-    moveBackward(4.0);
-    rotateLeft(90.0);
-    moveForward(10.0);
-    rotateRight(90.0);
+    maneuver(-SPEED_OFFSET, -SPEED_OFFSET, 500);
+    stopMotors();
+    colorSensor_Y_ms -= 500;
+
+  } else if (colorSensor_Y_ms < 300) {
+    // Likely at back boundary (our back) - advance
+    DEBUG_PRINTLN(F("Back boundary - advancing"));
+
+    maneuver(SPEED_OFFSET, SPEED_OFFSET, 400);
+    stopMotors();
+    colorSensor_Y_ms += 400;
+
+  } else if (colorSensor_X_ms > (FIELD_WIDTH_MS * 3 / 4)) {
+    // Near right boundary - turn left and move
+    DEBUG_PRINTLN(F("Right boundary - turning left"));
+
+    turnOnDimeLeft();
+    maneuver(SPEED_OFFSET, SPEED_OFFSET, 400);
+    stopMotors();
+    colorSensor_X_ms -= 400;
+    turnOnDimeRight();  // Face forward again
+
+  } else if (colorSensor_X_ms < (FIELD_WIDTH_MS / 4)) {
+    // Near left boundary - turn right and move
+    DEBUG_PRINTLN(F("Left boundary - turning right"));
+
+    turnOnDimeRight();
+    maneuver(SPEED_OFFSET, SPEED_OFFSET, 400);
+    stopMotors();
+    colorSensor_X_ms += 400;
+    turnOnDimeLeft();  // Face forward again
+
   } else {
-    // Evade RIGHT
-    moveBackward(4.0);
-    rotateRight(90.0);
-    moveForward(10.0);
-    rotateLeft(90.0);
+    // Unexpected boundary in middle - conservative reverse
+    DEBUG_PRINTLN(F("Unexpected boundary - conservative reverse"));
+
+    maneuver(-SPEED_OFFSET, -SPEED_OFFSET, 400);
+    stopMotors();
+    colorSensor_Y_ms -= 400;
   }
 
-  delay(300);
+  delay(200);
 }
 
-void recoverPosition() {
-  // Recovery procedure when position becomes uncertain
-  // Uses sensor fusion to re-establish coordinate system
-
-  #if DEBUG_MODE
-    Serial.println("Executing position recovery...");
-  #endif
+void handleObstacleAvoidance() {
+  DEBUG_PRINTLN(F("Avoiding obstacle"));
 
   stopMotors();
-  ensureArmsRetracted();
+  statusBeep(4000, 100);
 
-  // Step 1: Check boundary proximity using color sensor
-  bool atBoundary = detectBlackBoundary();
-  int fieldSide = checkFieldSide();
+  // Simple avoidance: back up and shift lane
+  maneuver(-SPEED_OFFSET, -SPEED_OFFSET, 300);
+  stopMotors();
+  colorSensor_Y_ms -= 300;
 
-  if(atBoundary) {
-    // At a boundary - use this for position reset
-    #if DEBUG_MODE
-      Serial.println("Recovery: At boundary");
-    #endif
+  // Shift right slightly
+  turnOnDimeRight();
+  maneuver(SPEED_OFFSET, SPEED_OFFSET, 200);
+  stopMotors();
+  turnOnDimeLeft();
 
-    if(colorSensor_Y > 30.0) {
-      // Probably at front boundary (opponent's back edge)
-      colorSensor_Y = 40.0; // Reset to known boundary position
-      moveBackward(6.0);    // Back away to safe zone
-    } else {
-      // Probably at back boundary (own back edge)
-      colorSensor_Y = 4.0;  // Reset to back boundary
-      moveForward(6.0);     // Move forward to safe zone
-    }
+  colorSensor_X_ms += 150;  // Approximate shift
 
-  } else if(fieldSide != 0) {
-    // On colored field, can verify position
-    bool expectedOnOwnSide = (colorSensor_Y < 24.0);
-    bool actuallyOnOwnSide = (fieldSide == 1);
-
-    if(expectedOnOwnSide != actuallyOnOwnSide) {
-      // Position is wrong - crossed midfield unexpectedly
-      #if DEBUG_MODE
-        Serial.println("Recovery: Wrong side of field");
-      #endif
-
-      if(actuallyOnOwnSide && !expectedOnOwnSide) {
-        // We're on own side but thought we were on opponent's
-        // We've drifted back - adjust Y estimate
-        colorSensor_Y = 18.0; // Assume middle of own territory
-      } else {
-        // We're on opponent's side but thought we were on own
-        // We've penetrated too far - retreat
-        colorSensor_Y = 30.0;
-        moveBackward(8.0);
-      }
-    }
-  }
-
-  // Step 2: Re-zero heading using gyroscope
-  // Assume we should be facing forward (0°) after recovery
-  float headingOffset = heading;
-  if(abs(headingOffset) > 10.0) {
-    // Significant heading drift - correct it
-    rotateToHeading(0.0);
-  }
-
-  // Clear uncertainty flag
-  positionUncertain = false;
-
-  #if DEBUG_MODE
-    Serial.print("Recovery complete. New position: X=");
-    Serial.print(colorSensor_X);
-    Serial.print(" Y=");
-    Serial.println(colorSensor_Y);
-  #endif
+  delay(200);
 }
 
-// ==================== UTILITY FUNCTIONS ====================
+// ═══════════════════════════════════════════════════════════════════════════════
+//  UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 void statusBeep(int frequency, int duration) {
   tone(PIN_BUZZER, frequency, duration);
   delay(duration);
 }
 
-float normalizeAngle(float angle) {
-  // Normalize to -180 to +180 range
-  while(angle > 180.0) angle -= 360.0;
-  while(angle < -180.0) angle += 360.0;
-  return angle;
+void blinkLED(int pin, int count) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(pin, HIGH);
+    delay(150);
+    digitalWrite(pin, LOW);
+    delay(150);
+  }
 }
 
-// Watchdog check: returns true if robot appears stuck (no Y progress)
-bool checkWatchdog() {
-  unsigned long now = millis();
-
-  // Check if we've made progress
-  if(abs(colorSensor_Y - lastWatchdogY) >= WATCHDOG_MIN_PROGRESS) {
-    // Made progress - reset watchdog
-    lastSweepProgress = now;
-    lastWatchdogY = colorSensor_Y;
-    return false;
-  }
-
-  // Check if watchdog timeout exceeded
-  if(now - lastSweepProgress > WATCHDOG_TIMEOUT_MS) {
-    #if DEBUG_MODE
-      Serial.println("WATCHDOG: Robot appears stuck!");
-    #endif
-    return true;
-  }
-
-  return false;
+unsigned long getMatchElapsed() {
+  return millis() - matchStartTime;
 }
 
-// Reset watchdog (call at start of new sweep)
-void resetWatchdog() {
-  lastSweepProgress = millis();
-  lastWatchdogY = colorSensor_Y;
+bool isMatchOver() {
+  return (getMatchElapsed() >= MATCH_DURATION_MS);
 }
