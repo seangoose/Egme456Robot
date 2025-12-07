@@ -1,395 +1,361 @@
 /* ═══════════════════════════════════════════════════════════════════════════════
-   AUTOWIPER GYRO V11 - S-PATTERN BOUNDARY EVASION
-   Target: Arduino Uno | Sensor: LSM6DSOX + TCS3200
-   Updates:
-     - V10: Reduced COLOR_DIFF_MIN from 70 to 30 (tape seam fix)
-     - V11: Intelligent S-pattern boundary evasion system
-       * When black detected at angle, probes ±30°, ±60°, ±90°, ±120°, ±150°
-       * Finds escape direction and continues forward
-       * Handles parallel boundary approaches gracefully
+   AUTOWIPER V22 - PERIMETER PILOT (PREDICTIVE)
+   Target: Arduino Uno | Sensor: TCS3200 + LSM6DSOX
+   Logic: 
+     - Odometry tracks (X,Y).
+     - Turns are triggered by Coordinate Targets (Predictive).
+     - Sensors correct position errors (Reality Check).
+   
+   Pattern: Start -> Left Turn -> Right Turn loops (Box Pattern)
    ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include <Servo.h>
 #include <Wire.h>
 #include <Adafruit_LSM6DSOX.h>
-#include <Adafruit_Sensor.h>
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  PINS & OBJECTS
+//  CONSTANTS & PINS
 // ═══════════════════════════════════════════════════════════════════════════════
 #define PIN_SERVO_LEFT    13
 #define PIN_SERVO_RIGHT   12
-#define PIN_ARM_LEFT      11
-#define PIN_ARM_RIGHT     10
 #define PIN_BUZZER        3
-
-// TCS3200 Color Sensor
 #define PIN_COLOR_OUT     4
-#define PIN_COLOR_S2      5
-#define PIN_COLOR_S3      A0
-
+#define PIN_COLOR_S2      5   
+#define PIN_COLOR_S3      A0  
+#define PIN_COLOR_S0      6   
+#define PIN_COLOR_S1      7   
 #define SERVO_STOP        1500
 
-// --- CRITICAL THRESHOLDS ---
-#define COMP_BLACK_LIMIT  400  // Competition: Both > 400 is Black
-#define TEST_BRIGHT_LIMIT 300  // Test: Both < 300 is "Bright Mode"
+// --- PHYSICS CONSTANTS ---
+#define ROBOT_SPEED       0.0055 // inches per ms
+#define WALL_LIMIT        22.0   // Actual Black Line
+#define TARGET_LIMIT      18.0   // Virtual Corner (Turn point)
+#define START_Y           -22.0
+#define START_X           0.0
 
-// UPDATED: Tightened from 70 to 30 to ignore tape seams
-#define COLOR_DIFF_MIN    30   
-// Explanation:
-// Tape Seam (R:107 B:176) Diff is 69.  69 > 30 -> SAFE (Color)
-// Real Grey (R:150 B:160) Diff is 10.  10 < 30 -> BLACK (Line)
+// --- SENSOR THRESHOLDS ---
+#define BLACK_MIN_VAL     50  
+#define GREEN_BLACK_LIMIT 65  
+#define RED_STRONG_LIMIT  38
+#define BLUE_STRONG_LIMIT 42
 
-Servo servoLeft, servoRight, armLeft, armRight;
+Servo servoLeft, servoRight;
 Adafruit_LSM6DSOX lsm6ds;
 
-// Gyro State
-float gyroHeading = 0.0;
-unsigned long lastGyroUpdate = 0;
-bool gyroReady = false;
+// --- STATE MACHINE ---
+enum State {
+  WAIT_FOR_START,
+  LAUNCH_NORTH,
+  FIRST_TURN_LEFT,
+  DRIVE_WEST,
+  TURN_NORTH,
+  DRIVE_NORTH,
+  TURN_EAST,
+  DRIVE_EAST,
+  TURN_SOUTH,
+  DRIVE_SOUTH,
+  TURN_WEST_LOOP // Loops back to DRIVE_WEST
+};
+
+State currentState = WAIT_FOR_START;
+
+// --- ODOMETRY GLOBALS ---
+float posX = START_X;
+float posY = START_Y;
+float gyroHeading = 0.0; // 0=North, 90=East, 180=South, -90=West
+unsigned long lastUpdate = 0;
+int currentZoneColor = -1; // 0=Blue, 1=Red
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  SETUP
 // ═══════════════════════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(9600);
-  while (!Serial);
-
+  while(!Serial);
+  
   servoLeft.attach(PIN_SERVO_LEFT);
   servoRight.attach(PIN_SERVO_RIGHT);
-  armLeft.attach(PIN_ARM_LEFT);
-  armRight.attach(PIN_ARM_RIGHT);
   stopMotors();
 
-  armLeft.write(152);
-  armRight.write(28);
-
   pinMode(PIN_BUZZER, OUTPUT);
-  
-  // Color sensor pins
   pinMode(PIN_COLOR_OUT, INPUT);
   pinMode(PIN_COLOR_S2, OUTPUT);
   pinMode(PIN_COLOR_S3, OUTPUT);
+  pinMode(PIN_COLOR_S0, OUTPUT);
+  pinMode(PIN_COLOR_S1, OUTPUT);
 
-  Serial.println(F("\n=== GYRO V11 + S-PATTERN EVASION ==="));
-  
+  // 100% Scaling
+  digitalWrite(PIN_COLOR_S0, HIGH);
+  digitalWrite(PIN_COLOR_S1, HIGH);
+
   Wire.begin(); 
-  
-  if (lsm6ds.begin_I2C()) {
-    lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_500_DPS); 
-    lsm6ds.setGyroDataRate(LSM6DS_RATE_104_HZ);
-    gyroReady = true;
-    Serial.println(F("Gyro OK."));
-  } else {
-    Serial.println(F("GYRO FAILED. Check wiring."));
-    while (1);
-  }
+  if(!lsm6ds.begin_I2C()) while(1);
+  lsm6ds.setGyroRange(LSM6DS_GYRO_RANGE_500_DPS); 
+  lsm6ds.setGyroDataRate(LSM6DS_RATE_104_HZ);
 
-  displayMenu();
+  Serial.println(F("=== V22 PERIMETER PILOT ==="));
+  Serial.println(F("Start: (0, -22). Heading: North."));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MAIN LOOP
 // ═══════════════════════════════════════════════════════════════════════════════
 void loop() {
-  if (Serial.available() > 0) {
-    char input = Serial.read();
-    delay(10); 
-    while(Serial.available()) Serial.read(); // Clear buffer
-    
-    switch (input) {
-      case '1': test_Forward(); break;
-      case '2': turnToAngleGyro(90.0); break;
-      case '3': turnToAngleGyro(-90.0); break;
-      case '4': turnToAngleGyro(180.0); break;
-      case '5': test_ColorSensor(); break;
-      case 'm': displayMenu(); break;
-      default: break; 
-    }
-    
-    if (input >= '1' && input <= '5' || input == 'm') {
-      Serial.println(F("\nReady. Enter command:"));
-    }
-  }
-}
-
-void displayMenu() {
-  Serial.println(F("\n-- MENU --"));
-  Serial.println(F("1. Fwd 12in (S-Pattern Boundary Evasion)"));
-  Serial.println(F("2. LEFT 90 (Active Fix)"));
-  Serial.println(F("3. RIGHT 90 (Active Fix)"));
-  Serial.println(F("4. 180 Turn (Active Fix)"));
-  Serial.println(F("5. Continuous Color Monitor (Any Key to Stop)"));
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  COLOR SENSOR LOGIC
-// ═══════════════════════════════════════════════════════════════════════════════
-
-unsigned long measureColor(bool readRed) {
-  if(readRed) {
-    digitalWrite(PIN_COLOR_S2, LOW);
-    digitalWrite(PIN_COLOR_S3, LOW);
-  } else {
-    digitalWrite(PIN_COLOR_S2, LOW);
-    digitalWrite(PIN_COLOR_S3, HIGH);
-  }
-  delay(15); 
-  unsigned long duration = pulseIn(PIN_COLOR_OUT, LOW, 20000); 
-  if(duration == 0) duration = 1000; 
-  return duration;
-}
-
-// HELPER: Returns true ONLY if surface is black
-bool isSurfaceBlack(unsigned long r, unsigned long b) {
   
-  // 1. Competition Logic (Dark)
-  if (r > COMP_BLACK_LIMIT && b > COMP_BLACK_LIMIT) {
-    return true; 
-  }
-
-  // 2. Test Paper Logic (Bright but Grey)
-  if (r < TEST_BRIGHT_LIMIT && b < TEST_BRIGHT_LIMIT) {
-    int diff = abs((int)r - (int)b);
-    
-    // STRICT CHECK: Red and Blue must be VERY close (diff < 30)
-    if (diff < COLOR_DIFF_MIN) { 
-      return true; 
-    }
-  }
-
-  return false; 
-}
-
-void test_ColorSensor() {
-  Serial.println(F("\n-- COLOR MONITOR (V10 LOGIC) --"));
-  Serial.println(F("Send ANY KEY to return to menu..."));
+  // 1. UPDATE PHYSICS (Dead Reckoning)
+  updateOdometry();
   
-  delay(100); 
-  while(Serial.available()) Serial.read();
+  // 2. CHECK SENSORS (Reality Correction)
+  checkSensorsAndCorrect();
 
-  while (!Serial.available()) {
-    unsigned long red = measureColor(true);
-    unsigned long blue = measureColor(false);
+  // 3. EXECUTE MISSION
+  switch(currentState) {
     
-    Serial.print("R: "); Serial.print(red);
-    Serial.print("\tB: "); Serial.print(blue);
-    
-    if (isSurfaceBlack(red, blue)) {
-       Serial.println(F("\t[BLACK LINE]"));
-    } else {
-       if (red < blue) Serial.println(F("\t[RED Surface]"));
-       else Serial.println(F("\t[BLUE Surface]"));
-    }
-    
-    delay(100); 
-  }
-  while(Serial.available()) Serial.read();
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  INTELLIGENT BOUNDARY EVASION (S-PATTERN)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-bool evadeBlackBoundary() {
-  Serial.println(F("\n>>> BOUNDARY EVASION INITIATED <<<"));
-  statusBeep(2000, 200);
-  delay(100);
-  statusBeep(2500, 200);
-
-  // Step 1: Back up to create maneuvering space
-  Serial.println(F("Backing up..."));
-  maneuver(-200, -200, 600);
-  stopMotors();
-  delay(200);
-
-  // Step 2: S-Pattern Probe - alternating left/right with increasing angles
-  // We'll try: ±30°, ±60°, ±90°, ±120° in an S-pattern
-  int probeAngles[] = {30, -60, 90, -120, 150};  // Right, Left, Right, Left, Right
-  int numProbes = 5;
-
-  for (int i = 0; i < numProbes; i++) {
-    Serial.print(F("Probe #")); Serial.print(i+1);
-    Serial.print(F(": Turning ")); Serial.print(probeAngles[i]); Serial.println(F("°"));
-
-    // Make the turn
-    if (!turnToAngleGyro((float)probeAngles[i])) {
-      Serial.println(F("Turn failed, trying next..."));
-      continue;
-    }
-
-    delay(200);
-
-    // Check color after turn
-    unsigned long r = measureColor(true);
-    unsigned long b = measureColor(false);
-
-    Serial.print(F("  Post-turn: R:")); Serial.print(r);
-    Serial.print(F(" B:")); Serial.print(b);
-
-    if (!isSurfaceBlack(r, b)) {
-      // Found clear path!
-      Serial.println(F(" -> CLEAR! Path found."));
-      statusBeep(3000, 150);
-      delay(100);
-      statusBeep(3500, 150);
-
-      // Move forward a bit in this direction to fully escape boundary
-      Serial.println(F("Advancing in clear direction..."));
-      maneuver(250, 250, 800);
-      stopMotors();
-
-      // Reset heading for continued travel
-      zeroGyroHeading();
-      Serial.println(F("Evasion successful. Continuing forward.\n"));
-      return true;
-    } else {
-      Serial.println(F(" -> Still BLACK, trying next probe..."));
-      delay(200);
-    }
-  }
-
-  // If all probes failed, do emergency 180° turn
-  Serial.println(F("All probes failed! Emergency 180° turn..."));
-  statusBeep(1500, 500);
-  turnToAngleGyro(180.0);
-  maneuver(250, 250, 1000);
-  stopMotors();
-  zeroGyroHeading();
-  Serial.println(F("Emergency escape complete.\n"));
-  return false;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  FORWARD MOVEMENT (TEST 1)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-void test_Forward() {
-  Serial.println(F("Fwd 12in... (Scanning V10 LOGIC + S-EVASION)"));
-  Serial.print(F("3..")); statusBeep(1000,100); delay(900);
-  Serial.print(F("2..")); statusBeep(1000,100); delay(900);
-  Serial.println(F("GO"));
-
-  unsigned long startTime = millis();
-  unsigned long targetDuration = 2200;
-
-  while(millis() - startTime < targetDuration) {
-
-    unsigned long r = measureColor(true);
-    unsigned long b = measureColor(false);
-
-    Serial.print("R:"); Serial.print(r);
-    Serial.print(" B:"); Serial.print(b);
-
-    if (isSurfaceBlack(r, b)) {
-      stopMotors();
-      Serial.println(F(" -> BLACK DETECTED!"));
-
-      // Use intelligent S-pattern evasion
-      bool evaded = evadeBlackBoundary();
-
-      if (evaded) {
-        // Successfully found clear path, continue forward
-        Serial.println(F("Resuming forward movement..."));
-        startTime = millis();  // Reset timer to continue moving
-      } else {
-        // Emergency escape completed, end this run
-        Serial.println(F("Emergency escape complete. Ending run."));
-        return;
+    case WAIT_FOR_START:
+      if (Serial.available() && Serial.read() == '1') {
+        Serial.println(F("LAUNCH!"));
+        statusBeep(1000, 200);
+        currentState = LAUNCH_NORTH;
       }
+      break;
 
-    } else {
-      Serial.println(F(" -> OK"));
-      maneuver(250, 250, 0);
-      delay(50);
-    }
-  }
+    case LAUNCH_NORTH:
+      // Drive from Y=-22 to Y=-16 (Safe Zone)
+      driveStraight(200);
+      if (posY > -16.0) {
+        stopMotors();
+        currentState = FIRST_TURN_LEFT;
+      }
+      break;
 
-  stopMotors();
-  Serial.println(F("Forward complete."));
-}
+    case FIRST_TURN_LEFT:
+      // User Logic: "First turn Left"
+      Serial.println(F("Turn 1: LEFT (Face West)"));
+      turnToHeading(-90); 
+      currentState = DRIVE_WEST;
+      break;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  GYRO TURN LOGIC
-// ═══════════════════════════════════════════════════════════════════════════════
+    // --- THE LOOP ---
+    
+    case DRIVE_WEST:
+      // Target: X = -18
+      driveStraight(200);
+      // Correction: If drifted too far Y (North/South), steer back? 
+      // Handled in driveStraight via P-Control on Heading.
+      
+      if (posX < -TARGET_LIMIT) { // Reached Virtual Corner
+        Serial.println(F("Corner Reached. Turning Right."));
+        currentState = TURN_NORTH;
+      }
+      break;
 
-void updateGyroscope() {
-  sensors_event_t accel, gyro, temp;
-  if (!lsm6ds.getEvent(&accel, &gyro, &temp)) return;
-  unsigned long now = millis();
-  float dt = (now - lastGyroUpdate) / 1000.0;
-  if (dt > 0.001 && dt < 0.5) {
-    gyroHeading += gyro.gyro.z * dt * 57.2958;
-    while (gyroHeading > 180.0) gyroHeading -= 360.0;
-    while (gyroHeading < -180.0) gyroHeading += 360.0;
-  }
-  lastGyroUpdate = now;
-}
+    case TURN_NORTH:
+      // User Logic: "Next turn has to be Right"
+      turnToHeading(0); // 0 is North
+      currentState = DRIVE_NORTH;
+      break;
 
-void zeroGyroHeading() {
-  gyroHeading = 0.0;
-  lastGyroUpdate = millis();
-  for (int i = 0; i < 10; i++) { 
-    updateGyroscope();
-    delay(10);
-  }
-  gyroHeading = 0.0;
-}
+    case DRIVE_NORTH:
+      // Target: Y = 18
+      driveStraight(200);
+      if (posY > TARGET_LIMIT) {
+        currentState = TURN_EAST;
+      }
+      break;
 
-bool turnToAngleGyro(float targetAngle) {
-  if (!gyroReady) return false;
-  Serial.print(F("Turning to ")); Serial.println(targetAngle);
-  zeroGyroHeading();
-  unsigned long startTime = millis();
-  bool turnRight = (targetAngle < 0); 
-  float absTarget = abs(targetAngle);
-  
-  while (abs(abs(gyroHeading) - absTarget) > 15.0) {
-    updateGyroscope();
-    if (millis() - startTime > 3000) break;
-    maneuver(turnRight ? 400 : -400, turnRight ? -400 : 400, 0);
-    delay(20);
-  }
-  while (abs(abs(gyroHeading) - absTarget) > 5.0) {
-    updateGyroscope();
-    if (millis() - startTime > 4000) break;
-    maneuver(turnRight ? 200 : -200, turnRight ? -200 : 200, 0);
-    delay(20);
-  }
-  while (abs(abs(gyroHeading) - absTarget) > 2.0) {
-    updateGyroscope();
-    if (millis() - startTime > 5000) break;
-    maneuver(turnRight ? 120 : -120, turnRight ? -120 : 120, 0);
-    delay(30);
-  }
-  
-  stopMotors();
-  delay(250); 
-  
-  for(int attempt = 1; attempt <= 5; attempt++) {
-    updateGyroscope();
-    float rawError = targetAngle - gyroHeading;
-    if (abs(rawError) <= 1.0) {
+    case TURN_EAST:
+      turnToHeading(90); // 90 is East
+      currentState = DRIVE_EAST;
+      break;
+
+    case DRIVE_EAST:
+      // Target: X = 18
+      driveStraight(200);
+      if (posX > TARGET_LIMIT) {
+        currentState = TURN_SOUTH;
+      }
+      break;
+
+    case TURN_SOUTH:
+      turnToHeading(180); // 180 is South
+      currentState = DRIVE_SOUTH;
+      break;
+
+    case DRIVE_SOUTH:
+      // Target: Y = -18
+      driveStraight(200);
+      if (posY < -TARGET_LIMIT) {
+        currentState = TURN_WEST_LOOP;
+      }
+      break;
+
+    case TURN_WEST_LOOP:
+      turnToHeading(270); // 270 (-90) is West
+      // We completed a lap! 
+      // Future: Increment Lap Counter, reduce TARGET_LIMIT to spiral in.
+      Serial.println(F("Lap Complete!"));
       statusBeep(2000, 100);
-      Serial.println(F(">> LOCKED <<"));
-      return true;
-    }
-    int fixSpeed = 150;
-    if (rawError > 0) maneuver(-fixSpeed, fixSpeed, 50); 
-    else maneuver(fixSpeed, -fixSpeed, 50);              
-    stopMotors();
-    delay(200);
+      currentState = DRIVE_WEST;
+      break;
   }
-  return false;
+  
+  delay(10);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ODOMETRY & PHYSICS
+// ═══════════════════════════════════════════════════════════════════════════════
+void updateOdometry() {
+  unsigned long now = millis();
+  float dt = (now - lastUpdate); // ms
+  lastUpdate = now;
+
+  // 1. Gyro
+  sensors_event_t a, g, t;
+  if(lsm6ds.getEvent(&a, &g, &t)) {
+    float gyroZ = g.gyro.z * 57.2958; 
+    if(abs(gyroZ) > 0.5) { // Noise filter
+      gyroHeading += gyroZ * (dt / 1000.0);
+    }
+  }
+
+  // 2. Position (Only if Motors are Active)
+  // Simplified: If current command was "Go", we update.
+  // We assume driveStraight calls update this.
+  // Actually, let's put the Pos update INSIDE driveStraight to be accurate.
+}
+
+void driveStraight(int speed) {
+  // 1. Maintain Heading (P-Control)
+  // We want to drive straight on the CURRENT Desired Heading
+  // Logic: Snap to nearest 90 degree cardinal direction
+  float desired = 0;
+  if (gyroHeading >= -45 && gyroHeading < 45) desired = 0; // North
+  else if (gyroHeading >= 45 && gyroHeading < 135) desired = 90; // East
+  else if (gyroHeading >= 135 || gyroHeading < -135) desired = 180; // South
+  else desired = -90; // West
+
+  float error = desired - gyroHeading;
+  // Handle wrap around (e.g. 180 vs -180) - simplified for now
+  
+  int adj = error * 2; // Gain
+  maneuver(speed + adj, speed - adj, 0);
+
+  // 2. Update Coordinate
+  unsigned long now = millis();
+  float dt = 10.0; // approx loop time
+  
+  // Convert Heading to Radians. 0 deg = North (+Y). 90 deg = East (+X).
+  // Math: X += sin(angle), Y += cos(angle)
+  float rads = gyroHeading * 0.0174533;
+  
+  posX += (ROBOT_SPEED * dt) * sin(rads);
+  posY += (ROBOT_SPEED * dt) * cos(rads);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  REALITY CHECKS (The Magic)
+// ═══════════════════════════════════════════════════════════════════════════════
+void checkSensorsAndCorrect() {
+  int surface = checkSurfaceColor(); // 0=Blue, 1=Red, 2=Black
+
+  // 1. BLACK DETECTED (Wall Hit)
+  if (surface == 2) {
+    Serial.println(F("!!! BLACK DETECTED (EARLY) !!!"));
+    stopMotors();
+    
+    // We hit a wall. Which one?
+    // Look at Heading.
+    if (gyroHeading > -45 && gyroHeading < 45) { // Driving North
+      posY = WALL_LIMIT; // We hit Top Wall
+      Serial.println(F("Hit Top Wall. Reset Y=22."));
+    }
+    else if (gyroHeading > 45 && gyroHeading < 135) { // Driving East
+      posX = WALL_LIMIT; // Hit Right Wall
+      Serial.println(F("Hit Right Wall. Reset X=22."));
+    }
+    else if (abs(gyroHeading) > 135) { // Driving South
+      posY = -WALL_LIMIT; // Hit Bottom Wall
+      Serial.println(F("Hit Bottom Wall. Reset Y=-22."));
+    }
+    else { // Driving West
+      posX = -WALL_LIMIT; // Hit Left Wall
+      Serial.println(F("Hit Left Wall. Reset X=-22."));
+    }
+    
+    // ACTION: Back up and Force Turn
+    maneuver(-200, -200, 600); 
+    stopMotors();
+    forceNextTurn();
+  }
+
+  // 2. COLOR TRANSITION (Center Line Crossing)
+  // If we cross from Blue->Red or Red->Blue, we know we are at X=0 or Y=0?
+  // User map: "Inner area is red rectangle and blue rectangle". 
+  // Assuming split down the middle?
+  // If we detect a switch, we can correct the non-travel axis to 0. 
+  // (Left for V23 Refinement)
+}
+
+void forceNextTurn() {
+  // If we hit a wall early, skip the drive state and jump to turn
+  if(currentState == DRIVE_WEST) currentState = TURN_NORTH;
+  else if(currentState == DRIVE_NORTH) currentState = TURN_EAST;
+  else if(currentState == DRIVE_EAST) currentState = TURN_SOUTH;
+  else if(currentState == DRIVE_SOUTH) currentState = TURN_WEST_LOOP;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
-void maneuver(int leftSpeed, int rightSpeed, int msTime) {
-  servoLeft.writeMicroseconds(SERVO_STOP + leftSpeed);
-  servoRight.writeMicroseconds(SERVO_STOP - rightSpeed);
-  if (msTime > 0) delay(msTime);
+void turnToHeading(float target) {
+  stopMotors();
+  Serial.print("Turning to "); Serial.println(target);
+  
+  unsigned long s = millis();
+  while(millis() - s < 3000) {
+    updateOdometry(); // Keep tracking gyro
+    
+    float error = target - gyroHeading;
+    // Handle -180/180 wrap logic if needed, but simple for now
+    
+    if(abs(error) < 2.0) break;
+    
+    int speed = 200;
+    if(abs(error) < 15.0) speed = 150;
+    
+    if(error > 0) maneuver(-speed, speed, 0); // Left
+    else maneuver(speed, -speed, 0); // Right
+    
+    delay(10);
+  }
+  stopMotors();
+}
+
+unsigned long readSensor(int s2, int s3) {
+  digitalWrite(PIN_COLOR_S2, s2);
+  digitalWrite(PIN_COLOR_S3, s3);
+  delay(4); 
+  unsigned long d = pulseIn(PIN_COLOR_OUT, LOW, 5000); 
+  if(d == 0) d = 1000; 
+  return d;
+}
+
+int checkSurfaceColor() {
+  unsigned long r = readSensor(LOW, LOW);   
+  unsigned long b = readSensor(LOW, HIGH);  
+  unsigned long g = readSensor(HIGH, HIGH); 
+  
+  if (r < RED_STRONG_LIMIT) return 1;
+  if (b < BLUE_STRONG_LIMIT) return 0;
+  if (r > BLACK_MIN_VAL && b > BLACK_MIN_VAL && g > GREEN_BLACK_LIMIT) return 2;
+  return 0; // Default
+}
+
+void maneuver(int left, int right, int ms) {
+  servoLeft.writeMicroseconds(SERVO_STOP + left);
+  servoRight.writeMicroseconds(SERVO_STOP - right);
+  if(ms > 0) delay(ms);
 }
 
 void stopMotors() {
