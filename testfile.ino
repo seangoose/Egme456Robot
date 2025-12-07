@@ -1,9 +1,12 @@
 /* ═══════════════════════════════════════════════════════════════════════════════
-   AUTOWIPER GYRO V10 - TAPE SEAM FIX
+   AUTOWIPER GYRO V11 - S-PATTERN BOUNDARY EVASION
    Target: Arduino Uno | Sensor: LSM6DSOX + TCS3200
-   Logic Update: 
-     - Reduced COLOR_DIFF_MIN from 70 to 30.
-     - Prevents tape seams (diff ~69) from triggering Black.
+   Updates:
+     - V10: Reduced COLOR_DIFF_MIN from 70 to 30 (tape seam fix)
+     - V11: Intelligent S-pattern boundary evasion system
+       * When black detected at angle, probes ±30°, ±60°, ±90°, ±120°, ±150°
+       * Finds escape direction and continues forward
+       * Handles parallel boundary approaches gracefully
    ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include <Servo.h>
@@ -68,7 +71,7 @@ void setup() {
   pinMode(PIN_COLOR_S2, OUTPUT);
   pinMode(PIN_COLOR_S3, OUTPUT);
 
-  Serial.println(F("\n=== GYRO + V10 SEAM FIX ==="));
+  Serial.println(F("\n=== GYRO V11 + S-PATTERN EVASION ==="));
   
   Wire.begin(); 
   
@@ -112,7 +115,7 @@ void loop() {
 
 void displayMenu() {
   Serial.println(F("\n-- MENU --"));
-  Serial.println(F("1. Fwd 12in (Stop on True Black)"));
+  Serial.println(F("1. Fwd 12in (S-Pattern Boundary Evasion)"));
   Serial.println(F("2. LEFT 90 (Active Fix)"));
   Serial.println(F("3. RIGHT 90 (Active Fix)"));
   Serial.println(F("4. 180 Turn (Active Fix)"));
@@ -185,20 +188,93 @@ void test_ColorSensor() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  INTELLIGENT BOUNDARY EVASION (S-PATTERN)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool evadeBlackBoundary() {
+  Serial.println(F("\n>>> BOUNDARY EVASION INITIATED <<<"));
+  statusBeep(2000, 200);
+  delay(100);
+  statusBeep(2500, 200);
+
+  // Step 1: Back up to create maneuvering space
+  Serial.println(F("Backing up..."));
+  maneuver(-200, -200, 600);
+  stopMotors();
+  delay(200);
+
+  // Step 2: S-Pattern Probe - alternating left/right with increasing angles
+  // We'll try: ±30°, ±60°, ±90°, ±120° in an S-pattern
+  int probeAngles[] = {30, -60, 90, -120, 150};  // Right, Left, Right, Left, Right
+  int numProbes = 5;
+
+  for (int i = 0; i < numProbes; i++) {
+    Serial.print(F("Probe #")); Serial.print(i+1);
+    Serial.print(F(": Turning ")); Serial.print(probeAngles[i]); Serial.println(F("°"));
+
+    // Make the turn
+    if (!turnToAngleGyro((float)probeAngles[i])) {
+      Serial.println(F("Turn failed, trying next..."));
+      continue;
+    }
+
+    delay(200);
+
+    // Check color after turn
+    unsigned long r = measureColor(true);
+    unsigned long b = measureColor(false);
+
+    Serial.print(F("  Post-turn: R:")); Serial.print(r);
+    Serial.print(F(" B:")); Serial.print(b);
+
+    if (!isSurfaceBlack(r, b)) {
+      // Found clear path!
+      Serial.println(F(" -> CLEAR! Path found."));
+      statusBeep(3000, 150);
+      delay(100);
+      statusBeep(3500, 150);
+
+      // Move forward a bit in this direction to fully escape boundary
+      Serial.println(F("Advancing in clear direction..."));
+      maneuver(250, 250, 800);
+      stopMotors();
+
+      // Reset heading for continued travel
+      zeroGyroHeading();
+      Serial.println(F("Evasion successful. Continuing forward.\n"));
+      return true;
+    } else {
+      Serial.println(F(" -> Still BLACK, trying next probe..."));
+      delay(200);
+    }
+  }
+
+  // If all probes failed, do emergency 180° turn
+  Serial.println(F("All probes failed! Emergency 180° turn..."));
+  statusBeep(1500, 500);
+  turnToAngleGyro(180.0);
+  maneuver(250, 250, 1000);
+  stopMotors();
+  zeroGyroHeading();
+  Serial.println(F("Emergency escape complete.\n"));
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  FORWARD MOVEMENT (TEST 1)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void test_Forward() {
-  Serial.println(F("Fwd 12in... (Scanning V10 LOGIC)"));
+  Serial.println(F("Fwd 12in... (Scanning V10 LOGIC + S-EVASION)"));
   Serial.print(F("3..")); statusBeep(1000,100); delay(900);
   Serial.print(F("2..")); statusBeep(1000,100); delay(900);
   Serial.println(F("GO"));
-  
+
   unsigned long startTime = millis();
-  unsigned long targetDuration = 2200; 
-  
+  unsigned long targetDuration = 2200;
+
   while(millis() - startTime < targetDuration) {
-    
+
     unsigned long r = measureColor(true);
     unsigned long b = measureColor(false);
 
@@ -207,18 +283,28 @@ void test_Forward() {
 
     if (isSurfaceBlack(r, b)) {
       stopMotors();
-      Serial.println(F(" -> BLACK DETECTED! Reversing..."));
-      statusBeep(2000, 500); 
-      maneuver(-250, -250, 1000); 
-      stopMotors();
-      return; 
+      Serial.println(F(" -> BLACK DETECTED!"));
+
+      // Use intelligent S-pattern evasion
+      bool evaded = evadeBlackBoundary();
+
+      if (evaded) {
+        // Successfully found clear path, continue forward
+        Serial.println(F("Resuming forward movement..."));
+        startTime = millis();  // Reset timer to continue moving
+      } else {
+        // Emergency escape completed, end this run
+        Serial.println(F("Emergency escape complete. Ending run."));
+        return;
+      }
+
     } else {
       Serial.println(F(" -> OK"));
-      maneuver(250, 250, 0); 
-      delay(50);             
+      maneuver(250, 250, 0);
+      delay(50);
     }
   }
-  
+
   stopMotors();
   Serial.println(F("Forward complete."));
 }
